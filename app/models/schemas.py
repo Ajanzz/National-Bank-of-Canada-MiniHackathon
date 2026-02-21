@@ -130,7 +130,8 @@ class SimulationRule(BaseModel):
 class SimulateRequest(BaseModel):
     """Simulate request."""
 
-    trades: list[Trade]
+    dataset_id: Optional[str] = None
+    trades: Optional[list[Trade]] = None
     rules: SimulationRule
 
 

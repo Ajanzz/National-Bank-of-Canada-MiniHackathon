@@ -15,7 +15,8 @@ export type CanonicalTradeField =
   | "entry_price"
   | "exit_price"
   | "pnl"
-  | "fees";
+  | "fees"
+  | "balance";
 
 export type ImportDatasetRequest = {
   raw_csv?: string;
@@ -68,6 +69,10 @@ export type DailyPnlPoint = {
 export type TradeTimelinePoint = {
   timestamp: string;
   pnl: number;
+  trade_count?: number;
+  wins?: number;
+  losses?: number;
+  flat?: number;
 };
 
 export type AnalysisOutput = {
@@ -112,7 +117,8 @@ export type ExplainResponse = {
 };
 
 export type SimulateRequest = {
-  trades: Array<{
+  dataset_id?: string;
+  trades?: Array<{
     timestamp: string;
     asset: string;
     side: string;
@@ -211,4 +217,69 @@ export type PracticeQuestionsResponse = {
     bias: BiasKey;
     score: number;
   }>;
+};
+
+export type BiasType = "REVENGE_TRADING" | "LOSS_AVERSION" | "RECENCY_BIAS" | "OVERTRADING";
+
+export type EmotionalCheckInAnswer = "YES" | "NO" | null;
+
+export type EmotionalCheckInQuestionResponse = {
+  question_id: string;
+  question: string;
+  answer: EmotionalCheckInAnswer;
+};
+
+export type EmotionalCheckInBiasPayload = {
+  bias_type: BiasType;
+  score: number;
+  responses: EmotionalCheckInQuestionResponse[];
+};
+
+export type BiasContextExplainerRequest = {
+  dataset_id: string;
+  session_id?: string;
+  top_two_biases: Array<{ bias_type: BiasType; score: number }>;
+  emotional_check_in: EmotionalCheckInBiasPayload[];
+  date_range?: { start: string; end: string };
+};
+
+export type BiasContextEntry = {
+  bias_type: BiasType;
+  bias_name: string;
+  score?: number;
+  market_events: Array<{ date: string; headline: string }>;
+  connection_explanation: string;
+  practical_takeaway: string;
+};
+
+export type PersonalizedBiasEntry = {
+  bias_type: BiasType;
+  bias_name: string;
+  headline: string;
+  supportive_explanation: string;
+  hypothetical_contributors: string[];
+  gentle_process_habits: string[];
+  checkin_summary: {
+    yes_count: number;
+    no_count: number;
+    skipped_count: number;
+  };
+  compassionate_note: string;
+};
+
+export type BiasContextExplainerResponse = {
+  session_id: string;
+  bias_contexts: BiasContextEntry[];
+  personalized_sections: PersonalizedBiasEntry[];
+  saved_emotional_check_in: Record<
+    string,
+    {
+      score?: number | null;
+      updated_at?: string;
+      responses: EmotionalCheckInQuestionResponse[];
+    }
+  >;
+  date_range?: { start: string; end: string };
+  global_note: string;
+  methodology: string;
 };

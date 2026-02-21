@@ -55,23 +55,20 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def trades_to_dataframe(trades: list[NormalizedTrade]) -> pd.DataFrame:
     """Convert a list of NormalizedTrade objects to a pandas DataFrame."""
-    rows = []
-    for t in trades:
-        rows.append({
-            "timestamp": t.timestamp,
-            "symbol": t.asset,
-            "side": t.side,
-            "quantity": t.quantity,
-            "entry_price": t.entry_price,
-            "exit_price": t.exit_price,
-            "pnl": t.profit_loss,
-            "balance": t.balance,
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df.sort_values("timestamp").reset_index(drop=True)
-    return df
+    if not trades:
+        return pd.DataFrame()
+    # Build column arrays directly — avoids per-row dict allocation
+    df = pd.DataFrame({
+        "timestamp":   pd.to_datetime([t.timestamp for t in trades], utc=True, errors="coerce"),
+        "symbol":      [t.asset        for t in trades],
+        "side":        [t.side         for t in trades],
+        "quantity":    [t.quantity     for t in trades],
+        "entry_price": [t.entry_price  for t in trades],
+        "exit_price":  [t.exit_price   for t in trades],
+        "pnl":         [t.profit_loss  for t in trades],
+        "balance":     [t.balance      for t in trades],
+    })
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
 def extract_features(df: pd.DataFrame) -> np.ndarray:
@@ -172,9 +169,15 @@ def extract_features(df: pd.DataFrame) -> np.ndarray:
     # ── Balance drawdown ────────────────────────────────────────────────
     if "balance" in df.columns:
         bal = df["balance"].astype(float)
+        # Shift balance so the minimum is always >= 1 before computing drawdown.
+        # This handles datasets where balance goes negative (e.g. overtrading).
+        bal_floor = bal.min()
+        if bal_floor <= 0:
+            bal = bal - bal_floor + 1.0  # shift so min == 1
         running_max = bal.cummax()
-        drawdown = ((running_max - bal) / running_max.replace(0, 1)).max()
-        balance_drawdown_pct = float(drawdown) * 100
+        # Avoid division by zero; running_max is always >= 1 after shift
+        drawdown = ((running_max - bal) / running_max).max()
+        balance_drawdown_pct = float(np.clip(drawdown, 0.0, 1.0)) * 100
     else:
         balance_drawdown_pct = 0.0
 
@@ -210,13 +213,127 @@ def extract_windowed_features(
 ) -> list[np.ndarray]:
     """
     Slide a window over the trade DataFrame and extract features per window.
-    Returns a list of 18-feature vectors (one per window).
+    Precomputes all column arrays once as numpy arrays so each window only
+    does index arithmetic — no per-window pandas overhead.
     """
     df = _normalize_df(df)
+    n_total = len(df)
+    if n_total < window_size:
+        return [extract_features(df)]
+
+    # ── Precompute arrays once ───────────────────────────────────────────
+    ts_ns   = df["timestamp"].values.astype("int64")          # nanoseconds
+    pnl_a   = df["pnl"].to_numpy(dtype=float)
+    qty_a   = df["quantity"].to_numpy(dtype=float)
+    ep_a    = df["entry_price"].to_numpy(dtype=float)
+    bal_a   = df["balance"].to_numpy(dtype=float) if "balance" in df.columns else None
+    side_a  = df["side"].str.lower().to_numpy()
+    sym_a   = df["symbol"].to_numpy() if "symbol" in df.columns else None
+
+    # Per-row time deltas in seconds (length n_total, first element = 0)
+    delta_ns = np.empty(n_total, dtype=float)
+    delta_ns[0] = 0.0
+    delta_ns[1:] = (ts_ns[1:] - ts_ns[:-1]) / 1e9  # ns → s
+
+    # Trade values
+    tv_a = qty_a * ep_a
+
     features = []
-    for start in range(0, len(df) - window_size + 1, stride):
-        window = df.iloc[start : start + window_size]
-        features.append(extract_features(window))
+    starts = range(0, n_total - window_size + 1, stride)
+    for s in starts:
+        e = s + window_size
+        # Window slices (views, no copy)
+        ts_w    = ts_ns[s:e]
+        pnl_w   = pnl_a[s:e]
+        qty_w   = qty_a[s:e]
+        tv_w    = tv_a[s:e]
+        side_w  = side_a[s:e]
+        # Deltas within window: ts_w[i] - ts_w[i-1]  (length w, first=0)
+        dw = np.empty(window_size, dtype=float)
+        dw[0] = 0.0
+        dw[1:] = (ts_w[1:] - ts_w[:-1]) / 1e9
+        deltas_w = dw[1:]  # length w-1, matches pandas .diff().dropna()
+
+        # ── Time features ──────────────────────────────────────────────
+        total_sec = float(ts_w[-1] - ts_w[0]) / 1e9
+        total_hours = max(total_sec / 3600, 0.001)
+        tph = window_size / total_hours
+        mean_d = float(deltas_w.mean()) if len(deltas_w) else 0.0
+        std_d  = float(deltas_w.std())  if len(deltas_w) else 0.0
+        burst  = int((deltas_w <= 60).sum())
+
+        # ── PnL features ───────────────────────────────────────────────
+        pnl_mean  = float(pnl_w.mean())
+        pnl_std   = float(pnl_w.std())
+        pnl_total = float(pnl_w.sum())
+        win_rate  = float((pnl_w > 0).sum() / window_size)
+
+        # ── Size features ──────────────────────────────────────────────
+        avg_qty = float(qty_w.mean())
+        std_qty = float(qty_w.std())
+        avg_tv  = float(tv_w.mean())
+
+        # ── Loss aversion: hold-time proxy ─────────────────────────────
+        wins_mask   = pnl_w > 0
+        losses_mask = ~wins_mask
+        # Use deltas as hold proxy; index deltas: trade i corresponds to delta[i-1]
+        hold_proxy = np.empty(window_size, dtype=float)
+        med_d = float(np.median(deltas_w)) if len(deltas_w) else 60.0
+        hold_proxy[0] = med_d
+        hold_proxy[1:] = deltas_w
+        win_hold  = float(hold_proxy[wins_mask].mean())   if wins_mask.sum()   > 0 else 1.0
+        loss_hold = float(hold_proxy[losses_mask].mean()) if losses_mask.sum() > 0 else 1.0
+        la_ratio  = loss_hold / max(win_hold, 0.001)
+
+        # ── Revenge trading features ────────────────────────────────────
+        loss_prev = pnl_w[:-1] < 0
+        if loss_prev.sum() > 0:
+            curr_qty_al  = qty_w[1:][loss_prev]
+            prev_qty_al  = qty_w[:-1][loss_prev]
+            sz_ratio_arr = curr_qty_al / np.maximum(prev_qty_al, 0.001)
+            avg_sz_ratio = float(sz_ratio_arr.mean())
+            re_deltas    = deltas_w[loss_prev[:len(deltas_w)]] if len(deltas_w) > 0 else np.array([300.0])
+            reentry_mean = float(re_deltas.mean()) if len(re_deltas) > 0 else 300.0
+        else:
+            avg_sz_ratio = 1.0
+            reentry_mean = 300.0
+
+        # Max consecutive loss streak (vectorised via run-length encoding)
+        losses_bool = (pnl_w <= 0).view(np.uint8)
+        streak = 0
+        max_str = 0
+        for v in losses_bool:
+            if v:
+                streak += 1
+                if streak > max_str:
+                    max_str = streak
+            else:
+                streak = 0
+
+        # ── Diversity features ──────────────────────────────────────────
+        side_changes = int((side_w[1:] != side_w[:-1]).sum())
+        side_switch  = float(side_changes / max(window_size - 1, 1))
+        unique_syms  = float(len(set(sym_a[s:e]))) if sym_a is not None else 1.0
+
+        # ── Balance drawdown ────────────────────────────────────────────
+        if bal_a is not None:
+            bw = bal_a[s:e].copy()
+            bf = bw.min()
+            if bf <= 0:
+                bw = bw - bf + 1.0
+            rmax = np.maximum.accumulate(bw)
+            dd = float(np.clip(((rmax - bw) / rmax).max(), 0.0, 1.0)) * 100
+        else:
+            dd = 0.0
+
+        features.append(np.array([
+            tph, mean_d, std_d, burst,
+            pnl_mean, pnl_std, pnl_total, win_rate,
+            avg_qty, std_qty, avg_tv,
+            la_ratio, avg_sz_ratio, reentry_mean, float(max_str),
+            side_switch, unique_syms, dd,
+        ], dtype=float))
+
     return features
 
 
@@ -224,14 +341,21 @@ def extract_features_from_trades(
     trades: list[NormalizedTrade],
     window_size: int = 50,
     stride: int = 25,
+    max_windows: int = 100,
 ) -> list[np.ndarray]:
     """
     Convert NormalizedTrade list to DataFrame and extract windowed features.
     If fewer trades than window_size, extract a single feature vector from all trades.
+    Uses an adaptive stride so the number of windows never exceeds max_windows,
+    keeping ML inference fast on large datasets (e.g. 10k trades).
     """
     df = trades_to_dataframe(trades)
     if len(df) < 2:
         return [np.zeros(len(FEATURE_NAMES), dtype=float)]
-    if len(df) >= window_size:
-        return extract_windowed_features(df, window_size=window_size, stride=stride)
-    return [extract_features(df)]
+    if len(df) < window_size:
+        return [extract_features(df)]
+    # Adaptive stride: ensure we don't generate more than max_windows windows
+    n_possible = (len(df) - window_size) // stride + 1
+    if n_possible > max_windows:
+        stride = max(window_size, (len(df) - window_size) // (max_windows - 1))
+    return extract_windowed_features(df, window_size=window_size, stride=stride)
