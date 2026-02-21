@@ -8,23 +8,26 @@ from langchain_openai import ChatOpenAI
 
 from app.core.logging import logger
 
-# Try to import optional LangChain components
+# Try to import optional LangChain prompt components.
+# Support both current (langchain_core) and legacy module paths.
 try:
-    from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 except ImportError:
-    ChatPromptTemplate = None
-    MessagesPlaceholder = None
-    logger.warning("ChatPromptTemplate/MessagesPlaceholder not available.")
+    try:
+        from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+    except ImportError:
+        ChatPromptTemplate = None
+        MessagesPlaceholder = None
+        logger.warning("ChatPromptTemplate/MessagesPlaceholder not available.")
 
+# Conversation memory is optional and may require an extra package depending on LangChain version.
 try:
-    from langchain_community.chat_message_histories import ChatMessageHistory
-    from langchain.memory import ConversationBufferMemory
+    from langchain_classic.memory import ConversationBufferMemory
 except ImportError:
     try:
         from langchain.memory import ConversationBufferMemory
     except ImportError:
         ConversationBufferMemory = None
-        logger.warning("ConversationBufferMemory not available. Chat memory features disabled.")
 
 
 class AIConfig:
@@ -37,48 +40,44 @@ class AIConfig:
 
     def _get_api_key(self) -> str:
         """Get API key from environment (read on-demand, never cached)."""
-        import os
         key = os.getenv("OPENAI_API_KEY", "")
         logger.debug(f"_get_api_key called: length={len(key)}, first 20 chars={key[:20] if key else 'EMPTY'}")
         return key
 
     def _get_model(self) -> str:
         """Get model from environment."""
-        import os
-        model = os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
-        return model
+        return os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
 
     def validate(self) -> bool:
         """Validate API key is configured."""
         api_key = self._get_api_key()
         logger.info(f"validate(): api_key length={len(api_key)}")
-        
+
         if not api_key:
-            logger.error("❌ API key is EMPTY")
+            logger.error("[ERROR] API key is EMPTY")
             return False
-        
+
         if api_key == "sk-your-api-key-here":
-            logger.error("❌ API key is PLACEHOLDER value")
+            logger.error("[ERROR] API key is PLACEHOLDER value")
             return False
-        
+
         if not api_key.startswith("sk-"):
-            logger.error(f"❌ API key has invalid format, starts with: {api_key[:10]}")
+            logger.error(f"[ERROR] API key has invalid format, starts with: {api_key[:10]}")
             return False
-        
-        logger.info(f"✓ API key validated (length: {len(api_key)})")
+
+        logger.info(f"[OK] API key validated (length: {len(api_key)})")
         return True
 
     def get_llm(self):
         """Get cached ChatOpenAI instance."""
-        # Return cached instance if available
         if self._llm_cache is not None:
             logger.debug("Returning cached LLM instance")
             return self._llm_cache
-            
+
         logger.info("Initializing ChatOpenAI LLM instance...")
         if not self.validate():
             raise ValueError("OpenAI API key not configured")
-        
+
         logger.info(f"Creating ChatOpenAI with API key length: {len(self._get_api_key())}")
         self._llm_cache = ChatOpenAI(
             api_key=self._get_api_key(),
@@ -86,7 +85,7 @@ class AIConfig:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        logger.info(f"✓ ChatOpenAI LLM initialized (model: {self._get_model()})")
+        logger.info(f"[OK] ChatOpenAI LLM initialized (model: {self._get_model()})")
         return self._llm_cache
 
     @staticmethod
@@ -95,7 +94,7 @@ class AIConfig:
         if ConversationBufferMemory is None:
             logger.warning("ConversationBufferMemory not available")
             return None
-        
+
         return ConversationBufferMemory(
             return_messages=True,
             memory_key="chat_history",
@@ -107,14 +106,14 @@ class AIConfig:
         if ChatPromptTemplate is None or MessagesPlaceholder is None:
             logger.warning("ChatPromptTemplate/MessagesPlaceholder not available")
             return None
-        
+
         return ChatPromptTemplate(
             input_variables=["user_query", "trading_context"],
             messages=[
                 (
                     "system",
                     """You are an expert trading coach specializing in helping traders recognize and overcome behavioral biases.
-                    
+
 Your role is to:
 1. Analyze trading decisions and identify potential biases
 2. Provide constructive, non-judgmental coaching
@@ -143,26 +142,27 @@ def verify_openai_config() -> bool:
     """Verify OpenAI API key is properly configured at startup."""
     try:
         from app.core.config import get_settings
+
         settings = get_settings()
         api_key = settings.openai_api_key
-        
+
         logger.info(f"DEBUG: verify_openai_config - api_key length: {len(api_key)}")
-        
+
         if not api_key:
-            logger.error("❌ OPENAI_API_KEY is EMPTY")
+            logger.error("[ERROR] OPENAI_API_KEY is EMPTY")
             logger.error("Please add OPENAI_API_KEY to your .env file")
             return False
-        
+
         if api_key == "sk-your-api-key-here":
-            logger.error("❌ OPENAI_API_KEY has placeholder value")
+            logger.error("[ERROR] OPENAI_API_KEY has placeholder value")
             logger.error("Please update OPENAI_API_KEY in your .env file with your actual API key")
             return False
-        
+
         if not api_key.startswith("sk-"):
-            logger.error(f"❌ OPENAI_API_KEY has invalid format")
+            logger.error("[ERROR] OPENAI_API_KEY has invalid format")
             return False
-        
-        logger.info(f"✓ OpenAI API key detected (length: {len(api_key)}, starts: {api_key[:10]})")
+
+        logger.info(f"[OK] OpenAI API key detected (length: {len(api_key)}, starts: {api_key[:10]})")
         return True
     except Exception as e:
         logger.error(f"Error verifying OpenAI config: {e}")

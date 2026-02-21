@@ -22,7 +22,7 @@ from app.events.provider import StubEventsProvider
 from app.events.shock_generator import generate_market_shocks_from_trades
 from app.utils.stats_utils import mean, percentile
 from app.ml.features import extract_features_from_trades
-from app.ml.model import BiasMLClassifier
+from app.ml.model import get_classifier
 
 # Mapping from internal BiasCard bias_type to the ML class label
 _BIAS_TO_ML_CLASS: dict[str, str] = {
@@ -34,6 +34,17 @@ _BIAS_TO_ML_CLASS: dict[str, str] = {
 
 _ML_WINDOW_SIZE = 50
 _ML_STRIDE = 25
+
+
+def _sanitize(obj):
+    """Recursively replace nan/inf floats with 0 so JSON serialization never fails."""
+    if isinstance(obj, float):
+        return 0.0 if not np.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
 
 
 def compute_danger_hours_heatmap(trades: list[NormalizedTrade]) -> list[list[int]]:
@@ -85,40 +96,31 @@ def analyze_trades(
             ml_probabilities={},
         )
     
-    # Basic statistics
+    # Basic statistics — vectorized with numpy
     total_trades = len(trades)
-    wins = [t for t in trades if t.is_win]
-    losses = [t for t in trades if not t.is_win]
-    
-    win_rate = len(wins) / total_trades if total_trades > 0 else 0
-    total_pnl = sum(t.profit_loss for t in trades)
-    avg_pnl = mean([t.profit_loss for t in trades])
-    pnls = [t.profit_loss for t in trades]
-    
+    pnls = np.fromiter((t.profit_loss for t in trades), dtype=np.float64, count=total_trades)
+    wins_mask = pnls > 0
+    n_wins = int(wins_mask.sum())
+    n_losses = total_trades - n_wins
+
+    win_rate = n_wins / total_trades if total_trades > 0 else 0.0
+    total_pnl = float(pnls.sum())
+    avg_pnl = float(pnls.mean()) if total_trades > 0 else 0.0
+
     if trades:
         first_balance = trades[0].balance - trades[0].profit_loss
         last_balance = trades[-1].balance
     else:
-        first_balance = 0
-        last_balance = 0
-    
-    # Calculate drawdown: maximum peak-to-trough decline
-    max_balance = 0
-    max_drawdown = 0
-    for trade in trades:
-        if trade.balance > max_balance:
-            max_balance = trade.balance
-        drawdown = max_balance - trade.balance
-        if drawdown > max_drawdown:
-            max_drawdown = drawdown
-    
-    # Calculate volatility: standard deviation of PnL
-    if len(pnls) > 1:
-        mean_pnl = mean(pnls)
-        variance = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls)
-        volatility = variance ** 0.5
-    else:
-        volatility = 0.0
+        first_balance = 0.0
+        last_balance = 0.0
+
+    # Drawdown: maximum peak-to-trough decline (vectorized)
+    balances = np.fromiter((t.balance for t in trades), dtype=np.float64, count=total_trades)
+    running_max = np.maximum.accumulate(balances)
+    max_drawdown = float((running_max - balances).max()) if total_trades > 0 else 0.0
+
+    # Volatility: std dev of PnL
+    volatility = float(pnls.std()) if total_trades > 1 else 0.0
     
     # Date range
     if trades:
@@ -128,10 +130,10 @@ def analyze_trades(
     else:
         date_range = ""
     
-    summary = {
+    summary = _sanitize({
         "total_trades": total_trades,
-        "winning_trades": len(wins),
-        "losing_trades": len(losses),
+        "winning_trades": n_wins,
+        "losing_trades": n_losses,
         "win_rate": round(win_rate * 100, 2),
         "total_pnl": round(total_pnl, 2),
         "avg_pnl_per_trade": round(avg_pnl, 2),
@@ -140,7 +142,7 @@ def analyze_trades(
         "max_drawdown": round(max_drawdown, 2),
         "volatility": round(volatility, 2),
         "date_range": date_range,
-    }
+    })
     
     # Run detectors
     overtrading_result = detect_overtrading(trades)
@@ -154,14 +156,15 @@ def analyze_trades(
 
     if scoring_mode == "hybrid":
         try:
-            ml_model = BiasMLClassifier()
+            ml_model = get_classifier()
             if ml_model.is_loaded:
                 window_features = extract_features_from_trades(
                     trades,
                     window_size=_ML_WINDOW_SIZE,
                     stride=_ML_STRIDE,
                 )
-                window_preds = [ml_model.predict_bias_probabilities(fv) for fv in window_features]
+                # Batch predict: one predict_proba call for all windows
+                window_preds = ml_model.predict_batch(window_features)
                 # Average probabilities across all windows
                 ml_classes = ml_model.classes
                 ml_probabilities = {
@@ -198,39 +201,39 @@ def analyze_trades(
             score=_blend_score(overtrading_result.score, "overtrading"),
             severity=_severity(_blend_score(overtrading_result.score, "overtrading")),
             flagged_trade_count=len(overtrading_result.flagged_trade_ids),
-            key_stats={
+            key_stats=_sanitize({
                 **overtrading_result.stats,
                 **({
                     "ml_score": round(ml_probabilities.get("overtrading", 0.0) * 100, 1),
                     "ml_active": True,
                 } if ml_active else {}),
-            },
+            }),
         ),
         BiasCard(
             bias_type="Loss Aversion",
             score=_blend_score(loss_aversion_result.score, "loss_aversion"),
             severity=_severity(_blend_score(loss_aversion_result.score, "loss_aversion")),
             flagged_trade_count=len(loss_aversion_result.flagged_trade_ids),
-            key_stats={
+            key_stats=_sanitize({
                 **loss_aversion_result.stats,
                 **({
                     "ml_score": round(ml_probabilities.get("loss_aversion", 0.0) * 100, 1),
                     "ml_active": True,
                 } if ml_active else {}),
-            },
+            }),
         ),
         BiasCard(
             bias_type="Revenge Trading",
             score=_blend_score(revenge_result.score, "revenge_trading"),
             severity=_severity(_blend_score(revenge_result.score, "revenge_trading")),
             flagged_trade_count=len(revenge_result.flagged_trade_ids),
-            key_stats={
+            key_stats=_sanitize({
                 **revenge_result.stats,
                 **({
                     "ml_score": round(ml_probabilities.get("revenge_trading", 0.0) * 100, 1),
                     "ml_active": True,
                 } if ml_active else {}),
-            },
+            }),
         ),
         BiasCard(
             # Recency bias has no ML equivalent — rules-only regardless of mode
@@ -238,10 +241,16 @@ def analyze_trades(
             score=recency_result.score,
             severity=recency_result.severity,
             flagged_trade_count=len(recency_result.flagged_trade_ids),
-            key_stats=recency_result.stats,
+            key_stats=_sanitize(recency_result.stats),
         ),
     ]
     
+    # Pre-convert flagged_trade_ids lists → sets for O(1) membership tests
+    ot_flagged = set(overtrading_result.flagged_trade_ids)
+    la_flagged = set(loss_aversion_result.flagged_trade_ids)
+    rv_flagged = set(revenge_result.flagged_trade_ids)
+    rc_flagged = set(recency_result.flagged_trade_ids)
+
     # Aggregate all flagged trades by trade_id
     all_flags = defaultdict(list)
     all_evidence = defaultdict(dict)
@@ -263,24 +272,26 @@ def analyze_trades(
     for trade_id, biases in all_flags.items():
         if trade_id in trade_map:
             trade = trade_map[trade_id]
-            # Compute confidence as average of detector scores
+            # Compute confidence as average of detector scores (O(1) set lookups)
             detector_scores = []
-            if trade_id in overtrading_result.flagged_trade_ids:
+            if trade_id in ot_flagged:
                 detector_scores.append(overtrading_result.score)
-            if trade_id in loss_aversion_result.flagged_trade_ids:
+            if trade_id in la_flagged:
                 detector_scores.append(loss_aversion_result.score)
-            if trade_id in revenge_result.flagged_trade_ids:
+            if trade_id in rv_flagged:
                 detector_scores.append(revenge_result.score)
-            if trade_id in recency_result.flagged_trade_ids:
+            if trade_id in rc_flagged:
                 detector_scores.append(recency_result.score)
             
             confidence = int(mean(detector_scores)) if detector_scores else 50
             
-            # Severity: if any is high, result is high
+            # Severity: high if revenge-flagged and revenge card is high
             severity = "low"
-            if any(b in all_flags[trade_id] for b in ["Revenge Trading"]):
-                if any(bias_card.severity == "high" for bias_card in bias_cards if bias_card.bias_type == "Revenge Trading"):
-                    severity = "high"
+            if trade_id in rv_flagged:
+                for bias_card in bias_cards:
+                    if bias_card.bias_type == "Revenge Trading" and bias_card.severity == "high":
+                        severity = "high"
+                        break
             
             evidence_str = "; ".join(
                 f"{bias}: {all_evidence[trade_id].get(bias, '')}"
@@ -308,10 +319,18 @@ def analyze_trades(
     # Heatmap
     heatmap = compute_danger_hours_heatmap(trades)
     
-    # Equity curve
+    # Equity curve — downsample to at most 500 points for large datasets
+    _MAX_EQUITY_POINTS = 500
+    equity_trades = trades
+    if len(trades) > _MAX_EQUITY_POINTS:
+        step = len(trades) // _MAX_EQUITY_POINTS
+        equity_trades = trades[::step]
+        # Always include the final trade
+        if equity_trades[-1] is not trades[-1]:
+            equity_trades = list(equity_trades) + [trades[-1]]
     equity_curve = [
         EquityCurvePoint(timestamp=trade.timestamp, balance=trade.balance)
-        for trade in trades
+        for trade in equity_trades
     ]
     
     # Events
@@ -348,5 +367,5 @@ def analyze_trades(
         equity_curve=equity_curve,
         optional_events=optional_events,
         ml_active=ml_active,
-        ml_probabilities={k: round(v, 4) for k, v in ml_probabilities.items()},
+        ml_probabilities=_sanitize({k: round(v, 4) for k, v in ml_probabilities.items()}),
     )

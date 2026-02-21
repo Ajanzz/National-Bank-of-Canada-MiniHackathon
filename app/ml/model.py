@@ -18,6 +18,17 @@ MODEL_PATH = MODEL_DIR / "bias_xgb.joblib"
 # 4 bias classes the model is trained on
 BIAS_CLASSES: list[str] = ["calm", "loss_aversion", "overtrading", "revenge_trading"]
 
+# Module-level singleton — loaded once at first use, never reloaded per request
+_CLASSIFIER_INSTANCE: "BiasMLClassifier | None" = None
+
+
+def get_classifier() -> "BiasMLClassifier":
+    """Return the module-level cached classifier, loading from disk only once."""
+    global _CLASSIFIER_INSTANCE
+    if _CLASSIFIER_INSTANCE is None:
+        _CLASSIFIER_INSTANCE = BiasMLClassifier()
+    return _CLASSIFIER_INSTANCE
+
 
 class BiasMLClassifier:
     """XGBoost 4-class bias classifier.
@@ -48,50 +59,47 @@ class BiasMLClassifier:
 
     # ------------------------------------------------------------------
     def predict_bias_probabilities(self, feature_vector: np.ndarray) -> dict[str, float]:
-        """
-        Given an 18-element feature vector, return per-class probabilities.
+        """Given an 18-element feature vector, return per-class probabilities."""
+        return self.predict_batch([feature_vector])[0]
 
-        Returns a dict like:
-            {"calm": 0.12, "overtrading": 0.65, "loss_aversion": 0.15, "revenge_trading": 0.08}
-
-        When no trained model exists, uses lightweight heuristic formulas.
+    def predict_batch(self, feature_vectors: list[np.ndarray]) -> list[dict[str, float]]:
         """
+        Batch prediction: run predict_proba once on the full matrix.
+        Dramatically faster than calling predict_bias_probabilities per window.
+        """
+        if not feature_vectors:
+            return []
+
+        X = np.array(feature_vectors, dtype=float)  # (n_windows, 18)
+
         if self.model is not None:
-            x = np.asarray(feature_vector, dtype=float).reshape(1, -1)
-            probs = self.model.predict_proba(x)[0]
-            return {label: float(p) for label, p in zip(self.classes, probs)}
+            probs = self.model.predict_proba(X)  # (n_windows, 4)
+            return [
+                {label: float(p) for label, p in zip(self.classes, row)}
+                for row in probs
+            ]
 
-        # ── Heuristic fallback ──────────────────────────────────────────
-        # Normalize first 18 features into [0, 1] range using rough maxima
-        fv = np.asarray(feature_vector, dtype=float)
-        safe = np.where(np.isfinite(fv), fv, 0.0)
+        # ── Heuristic fallback — vectorised ────────────────────────────
+        safe = np.where(np.isfinite(X), X, 0.0)
+        ncols = X.shape[1]
+        tph         = np.clip(safe[:, 0] / 20.0, 0, 1)
+        burst       = np.clip(safe[:, 3] / 10.0, 0, 1)       if ncols > 3  else np.full(len(X), 0.3)
+        hold_ratio  = np.clip((safe[:, 11] - 1.0) / 3.0, 0, 1) if ncols > 11 else np.full(len(X), 0.3)
+        size_ratio  = np.clip((safe[:, 12] - 1.0) / 2.0, 0, 1) if ncols > 12 else np.full(len(X), 0.3)
+        reentry     = np.clip(1.0 - safe[:, 13] / 600.0, 0, 1) if ncols > 13 else np.full(len(X), 0.3)
+        streak      = np.clip(safe[:, 14] / 5.0, 0, 1)         if ncols > 14 else np.full(len(X), 0.3)
 
-        # Feature indices (must match FEATURE_NAMES order in features.py)
-        # 0=trades_per_hour, 3=burst_count_60s, 11=loss_hold_ratio,
-        # 12=avg_size_after_loss_ratio, 13=reentry_after_loss_mean_sec, 14=max_streak
-        tph = float(np.clip(safe[0] / 20.0, 0, 1)) if len(safe) > 0 else 0.3
-        burst = float(np.clip(safe[3] / 10.0, 0, 1)) if len(safe) > 3 else 0.3
-        hold_ratio = float(np.clip((safe[11] - 1.0) / 3.0, 0, 1)) if len(safe) > 11 else 0.3
-        size_ratio = float(np.clip((safe[12] - 1.0) / 2.0, 0, 1)) if len(safe) > 12 else 0.3
-        reentry = float(np.clip(1.0 - safe[13] / 600.0, 0, 1)) if len(safe) > 13 else 0.3
-        streak = float(np.clip(safe[14] / 5.0, 0, 1)) if len(safe) > 14 else 0.3
+        overtrading   = np.minimum(1.0, 0.3 + tph * 0.5 + burst * 0.3)
+        loss_aversion = np.minimum(1.0, 0.2 + hold_ratio * 0.8)
+        revenge       = np.minimum(1.0, 0.2 + size_ratio * 0.4 + reentry * 0.3 + streak * 0.2)
+        calm          = np.maximum(0.0, 1.0 - overtrading - loss_aversion - revenge)
+        total         = overtrading + loss_aversion + revenge + calm
+        total         = np.where(total > 0, total, 1.0)
+        overtrading  /= total; loss_aversion /= total
+        revenge      /= total; calm          /= total
 
-        overtrading = float(min(1.0, 0.3 + tph * 0.5 + burst * 0.3))
-        loss_aversion = float(min(1.0, 0.2 + hold_ratio * 0.8))
-        revenge = float(min(1.0, 0.2 + size_ratio * 0.4 + reentry * 0.3 + streak * 0.2))
-        calm = float(max(0.0, 1.0 - overtrading - loss_aversion - revenge))
-
-        # Re-normalise so they sum to 1
-        total = overtrading + loss_aversion + revenge + calm
-        if total > 0:
-            overtrading /= total
-            loss_aversion /= total
-            revenge /= total
-            calm /= total
-
-        return {
-            "calm": calm,
-            "loss_aversion": loss_aversion,
-            "overtrading": overtrading,
-            "revenge_trading": revenge,
-        }
+        return [
+            {"calm": float(calm[i]), "loss_aversion": float(loss_aversion[i]),
+             "overtrading": float(overtrading[i]), "revenge_trading": float(revenge[i])}
+            for i in range(len(X))
+        ]

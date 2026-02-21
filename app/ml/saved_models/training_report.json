@@ -1,0 +1,90 @@
+{
+  "trained_from": "multi-seed generators",
+  "window_size": 50,
+  "stride": 25,
+  "n_trades_per_class": 5000,
+  "n_estimators_final": 1000,
+  "n_folds": 5,
+  "train_samples": 1916,
+  "test_samples": 480,
+  "total_samples": 2396,
+  "n_features": 18,
+  "cv_accuracy_mean": 0.9974965205288797,
+  "cv_accuracy_std": 0.001560421573753511,
+  "hyperparameters": {
+    "n_estimators": 1000,
+    "max_depth": 4,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "colsample_bytree": 0.7,
+    "min_child_weight": 5,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.5,
+    "gamma": 0.05
+  },
+  "feature_names": [
+    "trades_per_hour",
+    "mean_time_between_trades_sec",
+    "std_time_between_trades_sec",
+    "burst_count_60s",
+    "pnl_mean",
+    "pnl_std",
+    "pnl_total",
+    "win_rate",
+    "avg_quantity",
+    "std_quantity",
+    "avg_trade_value",
+    "loss_hold_to_win_hold_ratio",
+    "avg_size_after_loss_ratio",
+    "reentry_after_loss_mean_sec",
+    "consecutive_loss_streak_max",
+    "side_switch_rate",
+    "unique_symbols",
+    "balance_drawdown_pct"
+  ],
+  "classes": [
+    "calm",
+    "loss_aversion",
+    "overtrading",
+    "revenge_trading"
+  ],
+  "classification_report": {
+    "calm": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 120.0
+    },
+    "loss_aversion": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 120.0
+    },
+    "overtrading": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 120.0
+    },
+    "revenge_trading": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 120.0
+    },
+    "accuracy": 1.0,
+    "macro avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 480.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 480.0
+    }
+  }
+}

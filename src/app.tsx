@@ -1,5 +1,27 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useCallback, useEffect, useState, useRef, useMemo } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { LeftOutlined, RightOutlined, SearchOutlined } from "@ant-design/icons";
+import * as TabsPrimitive from "@radix-ui/react-tabs";
+import {
+  Bar as RechartsBar,
+  CartesianGrid as RechartsCartesianGrid,
+  ComposedChart as RechartsComposedChart,
+  Line as RechartsLine,
+  ResponsiveContainer,
+  Tooltip as RechartsTooltip,
+  XAxis as RechartsXAxis,
+  YAxis as RechartsYAxis,
+} from "recharts";
+import {
+  eachDayOfInterval,
+  endOfYear,
+  endOfMonth,
+  format as formatDate,
+  parseISO,
+  startOfDay,
+  startOfMonth,
+  startOfYear,
+} from "date-fns";
 import {
   Alert as AntAlert,
   Button as AntButton,
@@ -16,32 +38,31 @@ import {
   Upload as AntUpload,
 } from "antd";
 import "./styles.css";
-import { analyzeDataset, importDataset, simulateDataset, generatePracticeQuestions, getBiasContextExplainer, coachChat } from "./api/signalforge";
+import { analyzeDataset, importDatasetFile, simulateDataset, generatePracticeQuestions, getBiasContextExplainer, coachChat } from "./api/signalforge";
+import { PnlCalendarControl, type PnlCalendarMode, type PnlCalendarValue } from "./components/PnlCalendarControl";
 import type {
   AnalysisOutput,
   BiasKey,
-  CanonicalTradeField,
+  BiasContextExplainerResponse,
+  BiasType as CanonicalBiasType,
+  EmotionalCheckInAnswer,
+  EmotionalCheckInBiasPayload,
   FlaggedTrade,
-  ImportDatasetRequest,
   PracticeQuestion,
-  PracticeQuestionsResponse,
   ScoringMode,
 } from "./types/signalforge";
-
-const { TextArea: AntTextArea } = AntInput;
 
 /* --------------------------- Types --------------------------- */
 
 type Workspace =
   | "command"
   | "trades"
-  | "heatmap"
   | "simulator"
   | "replay"
   | "pulse"
   | "coach";
 
-type BiasType = "Overtrading" | "Loss Aversion" | "Revenge Trading" | "Recency Bias";
+type DisplayBiasType = "Overtrading" | "Loss Aversion" | "Revenge Trading" | "Recency Bias";
 
 type Trade = {
   id: string;
@@ -51,7 +72,8 @@ type Trade = {
   size: number;
   durationMin: number;
   pnl: number;
-  flags: BiasType[];
+  balance?: number;
+  flags: DisplayBiasType[];
   confidence: number; // 0..100
   evidence: string;
 };
@@ -63,14 +85,8 @@ type YahooHeadline = {
   publishedAt: string;
 };
 
-type CanonicalField =
-  Exclude<CanonicalTradeField, "trade_id">;
-
 type CsvImportPayload = {
-  rawText: string;
-  headers: string[];
-  rows: Record<string, string>[];
-  mapping: Partial<Record<CanonicalField, string>>;
+  file: File;
 };
 
 const ICON_PATHS = {
@@ -151,10 +167,6 @@ function getErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-function normalizeHeader(h: string) {
-  return h.trim().toLowerCase().replace(/\s+/g, "_");
-}
-
 function cleanText(value: string) {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -209,108 +221,6 @@ function formatHeadlineAge(publishedAt: string) {
 
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
-}
-
-/**
- * Robust-ish CSV parse for typical broker exports:
- * - supports quoted fields with commas
- * - supports CRLF / LF
- * - first row is header
- * Returns rows as objects keyed by header names (original header strings).
- */
-function parseCsv(text: string, maxRows: number = 5000): { headers: string[]; rows: Record<string, string>[] } {
-  // Remove UTF-8 BOM if present
-  const input = text.replace(/^\uFEFF/, "");
-
-  const rows: string[][] = [];
-  let cur: string[] = [];
-  let field = "";
-  let inQuotes = false;
-
-  const pushField = () => {
-    cur.push(field);
-    field = "";
-  };
-
-  const pushRow = () => {
-    // ignore fully empty trailing lines
-    const allEmpty = cur.every((c) => c.trim() === "");
-    if (!allEmpty) rows.push(cur);
-    cur = [];
-  };
-
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-    const next = input[i + 1];
-
-    if (inQuotes) {
-      if (ch === '"' && next === '"') {
-        // Escaped quote
-        field += '"';
-        i++;
-      } else if (ch === '"') {
-        inQuotes = false;
-      } else {
-        field += ch;
-      }
-    } else {
-      if (ch === '"') {
-        inQuotes = true;
-      } else if (ch === ",") {
-        pushField();
-      } else if (ch === "\n") {
-        pushField();
-        pushRow();
-        if (rows.length >= maxRows + 1) break; // +1 because header row
-      } else if (ch === "\r") {
-        // handle CRLF by skipping \r (newline handled on \n)
-      } else {
-        field += ch;
-      }
-    }
-  }
-  // last field/row
-  pushField();
-  pushRow();
-
-  if (rows.length === 0) return { headers: [], rows: [] };
-
-  const headers = rows[0].map((h) => h.trim());
-  const dataRows = rows.slice(1);
-
-  const objects: Record<string, string>[] = dataRows.map((r) => {
-    const obj: Record<string, string> = {};
-    for (let i = 0; i < headers.length; i++) {
-      obj[headers[i]] = (r[i] ?? "").trim();
-    }
-    return obj;
-  });
-
-  return { headers, rows: objects };
-}
-
-function guessMapping(headers: string[]): Partial<Record<CanonicalField, string>> {
-  const hnorm = headers.map((h) => ({ raw: h, n: normalizeHeader(h) }));
-
-  const find = (cands: string[]) => {
-    const set = new Set(cands);
-    const hit = hnorm.find((h) => set.has(h.n));
-    return hit?.raw;
-  };
-
-  // Common aliases across platforms
-  return {
-    timestamp: find(["timestamp", "time", "datetime", "date_time", "filled_time", "execution_time"]),
-    open_time: find(["open_time", "entry_time", "start_time"]),
-    close_time: find(["close_time", "exit_time", "end_time"]),
-    symbol: find(["symbol", "ticker", "instrument", "asset", "product"]),
-    side: find(["side", "action", "buy_sell", "direction"]),
-    size: find(["size", "qty", "quantity", "shares", "units", "amount"]),
-    entry_price: find(["entry_price", "open_price", "avg_entry_price", "price_in", "buy_price"]),
-    exit_price: find(["exit_price", "close_price", "avg_exit_price", "price_out", "sell_price"]),
-    pnl: find(["pnl", "profit", "profit_loss", "realized_pnl", "realized_profit", "net_pnl"]),
-    fees: find(["fees", "commission", "commissions", "fee"]),
-  };
 }
 
 /* --------------------------- UI Primitives --------------------------- */
@@ -386,7 +296,6 @@ function Dock({ active, onPick }: { active: Workspace; onPick: (w: Workspace) =>
   const items: Array<{ id: Workspace; label: string; icon: IconName }> = [
     { id: "command", label: "Command", icon: "command" },
     { id: "trades", label: "Trades", icon: "trades" },
-    { id: "heatmap", label: "Danger", icon: "heatmap" },
     { id: "simulator", label: "Simulation", icon: "simulator" },
     { id: "replay", label: "Practice", icon: "replay" },
     { id: "pulse", label: "Bias Context", icon: "pulse" },
@@ -440,7 +349,7 @@ function TerminalBar({
       <div className="topbar__right">
         <AntSelect
           className="topbar__select"
-          popupClassName="appSelectDropdown"
+          classNames={{ popup: { root: "appSelectDropdown" } }}
           style={scoringSelectStyle}
           value={scoringMode}
           onChange={(value) => onScoringModeChange(value as ScoringMode)}
@@ -474,28 +383,14 @@ function CsvUploadModal({
   onImported: (payload: CsvImportPayload) => void;
 }) {
   const [dragOver, setDragOver] = useState(false);
-  const [rawText, setRawText] = useState<string>("");
-  const [fileName, setFileName] = useState<string>("");
-  const [headers, setHeaders] = useState<string[]>([]);
-  const [rows, setRows] = useState<Record<string, string>[]>([]);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [err, setErr] = useState<string>("");
-
-  const [mapping, setMapping] = useState<Partial<Record<CanonicalField, string>>>({});
-
-  const previewRows = rows.slice(0, 10);
-
-  const required: CanonicalField[] = ["symbol", "side"];
-  const hasSomeTime = Boolean(mapping.timestamp || (mapping.open_time && mapping.close_time));
-  const canImport = headers.length > 0 && required.every((f) => mapping[f]) && hasSomeTime;
+  const canImport = Boolean(selectedFile);
 
   const reset = () => {
     setDragOver(false);
-    setRawText("");
-    setFileName("");
-    setHeaders([]);
-    setRows([]);
+    setSelectedFile(null);
     setErr("");
-    setMapping({});
   };
 
   const close = () => {
@@ -503,80 +398,31 @@ function CsvUploadModal({
     onClose();
   };
 
-  const loadText = async (file: File) => {
-    setErr("");
-    setFileName(file.name);
-
-    const text = await file.text();
-    setRawText(text);
-
-    try {
-      const parsed = parseCsv(text, 5000);
-      if (!parsed.headers.length) throw new Error("No headers found.");
-      setHeaders(parsed.headers);
-      setRows(parsed.rows);
-
-      const guess = guessMapping(parsed.headers);
-      setMapping(guess);
-    } catch (error: unknown) {
-      setErr(getErrorMessage(error, "Failed to parse CSV."));
-      setHeaders([]);
-      setRows([]);
-      setMapping({});
-    }
-  };
-
-  const onFilePick = async (f: File | null) => {
+  const onFilePick = (f: File | null) => {
     if (!f) return;
     if (!f.name.toLowerCase().endsWith(".csv")) {
       setErr("Please upload a .csv file.");
       return;
     }
-    await loadText(f);
+    setErr("");
+    setSelectedFile(f);
   };
 
   const onDrop = async (ev: React.DragEvent) => {
     ev.preventDefault();
     setDragOver(false);
     const f = ev.dataTransfer.files?.[0];
-    await onFilePick(f ?? null);
+    onFilePick(f ?? null);
   };
 
   const onImport = () => {
-    if (!canImport) return;
-    onImported({ rawText, headers, rows, mapping });
+    if (!selectedFile) return;
+    onImported({ file: selectedFile });
     close();
   };
 
   if (!open) return null;
-
-  const fieldLabels: Array<{ field: CanonicalField; label: string; hint: string; optional?: boolean }> = [
-    { field: "timestamp", label: "Timestamp", hint: "Single execution timestamp", optional: true },
-    { field: "open_time", label: "Open time", hint: "Entry/open timestamp", optional: true },
-    { field: "close_time", label: "Close time", hint: "Exit/close timestamp", optional: true },
-    { field: "symbol", label: "Symbol", hint: "Ticker / instrument", optional: false },
-    { field: "side", label: "Side", hint: "Buy/Sell or Long/Short", optional: false },
-    { field: "size", label: "Size", hint: "Qty / shares / units", optional: true },
-    { field: "entry_price", label: "Entry price", hint: "Average entry", optional: true },
-    { field: "exit_price", label: "Exit price", hint: "Average exit", optional: true },
-    { field: "pnl", label: "PnL", hint: "Profit/Loss", optional: true },
-    { field: "fees", label: "Fees", hint: "Commissions/fees", optional: true },
-  ];
-  const previewColumnKeys = headers.slice(0, 8);
-  const mappingSelectStyle = {
-    ["--ant-select-background-color" as string]: "rgba(5,8,14,.9)",
-    ["--ant-select-border-color" as string]: "rgba(255,255,255,.16)",
-    ["--ant-select-color" as string]: "rgba(232,240,255,.94)",
-  } as React.CSSProperties;
-  const previewColumns = previewColumnKeys.map((header, index) => ({
-    title: header,
-    dataIndex: header,
-    key: header,
-    ellipsis: true,
-    width: index === 0 ? 170 : undefined,
-    render: (value: string) => <span className="mono previewTable__cell">{(value ?? "").slice(0, 40)}</span>,
-  }));
-  const previewData = previewRows.map((row, index) => ({ key: `preview-${index}`, ...row }));
+  const fileSizeMb = selectedFile ? (selectedFile.size / (1024 * 1024)).toFixed(2) : null;
 
   return (
     <div className="modalOverlay" role="dialog" aria-modal="true" aria-label="CSV import modal" onMouseDown={close}>
@@ -585,7 +431,7 @@ function CsvUploadModal({
           <div className="modalHdr__left">
             <div className="modalTitle">Import Trade Log (CSV)</div>
             <div className="modalSub muted">
-              Upload a broker export. We'll detect columns and preview rows before importing.
+              Upload your CSV. All parsing and analytics run on the backend.
             </div>
           </div>
           <AntButton className="modalClose" onClick={close} aria-label="Close" type="text" icon={<Icon name="close" />} />
@@ -594,7 +440,7 @@ function CsvUploadModal({
         <div className="modalBody">
           {/* Dropzone */}
           <div
-            className={cn("dropzone", dragOver && "dropzone--over", headers.length > 0 && "dropzone--loaded")}
+            className={cn("dropzone", dragOver && "dropzone--over", selectedFile && "dropzone--loaded")}
             onDragEnter={(e) => {
               e.preventDefault();
               setDragOver(true);
@@ -614,16 +460,16 @@ function CsvUploadModal({
             </div>
             <div className="dropzone__text">
               <div className="dropzone__title">
-                {fileName ? (
+                {selectedFile ? (
                   <>
-                    Loaded <span className="mono">{fileName}</span>
+                    Loaded <span className="mono">{selectedFile.name}</span>
                   </>
                 ) : (
                   "Drag & drop your CSV here"
                 )}
               </div>
               <div className="muted">
-                {fileName ? `${rows.length.toLocaleString()} rows detected` : "or choose a file from your computer"}
+                {selectedFile && fileSizeMb ? `${fileSizeMb} MB selected` : "or choose a file from your computer"}
               </div>
             </div>
 
@@ -631,7 +477,7 @@ function CsvUploadModal({
               accept=".csv,text/csv"
               showUploadList={false}
               beforeUpload={(file) => {
-                void onFilePick(file);
+                onFilePick(file);
                 return false;
               }}
             >
@@ -640,98 +486,13 @@ function CsvUploadModal({
           </div>
 
           {err ? <AntAlert className="alert alert--danger" message={`Import error: ${err}`} type="error" showIcon /> : null}
-
-          {/* If loaded: Mapping + Preview */}
-          {headers.length > 0 ? (
-            <div className="modalGrid">
-              <div className="mapCard">
-                <div className="mapHdr">
-                  <div className="mapTitle">Column Mapping</div>
-                  <div className="muted">
-                    Required: <b>Symbol</b>, <b>Side</b>, and <b>(Timestamp or Open+Close)</b>
-                  </div>
-                </div>
-
-                <div className="mapList">
-                  {fieldLabels.map((f) => {
-                    const isRequired = !f.optional && (f.field === "symbol" || f.field === "side");
-
-                    return (
-                      <div className="mapRow" key={f.field}>
-                        <div className="mapLeft">
-                          <div className="mapLabel">
-                            {f.label}{" "}
-                            {isRequired ? <span className="req">*</span> : <span className="opt">optional</span>}
-                          </div>
-                          <div className="mapHint muted">{f.hint}</div>
-                        </div>
-
-                        <div className="mapRight">
-                          <AntSelect
-                            className={cn("topbar__select mapSelect", isRequired && !mapping[f.field] && "mapSelect--warn")}
-                            popupClassName="appSelectDropdown"
-                            getPopupContainer={(trigger) =>
-                              (trigger.closest(".modal") as HTMLElement | null) ?? document.body
-                            }
-                            style={mappingSelectStyle}
-                            value={mapping[f.field]}
-                            allowClear
-                            placeholder="Not mapped"
-                            dropdownMatchSelectWidth
-                            options={headers.map((h) => ({ label: h, value: h }))}
-                            onChange={(value) => setMapping((m) => ({ ...m, [f.field]: (value as string) || undefined }))}
-                          />
-                          {isRequired && !mapping[f.field] ? <Pill tone="danger">Required</Pill> : null}
-                          {!isRequired && !mapping[f.field] ? <Pill tone="muted">-</Pill> : null}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div className="mapFooter">
-                  {!hasSomeTime ? (
-                    <AntAlert
-                      className="alert alert--warn"
-                      message="Map Timestamp or both Open time and Close time."
-                      type="warning"
-                      showIcon
-                    />
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="previewCard">
-                <div className="previewHdr">
-                  <div className="mapTitle">Preview (first 10 rows)</div>
-                  <div className="muted">{headers.length} columns</div>
-                </div>
-
-                <div className="previewTableWrap">
-                  <AntTable
-                    className="previewTable"
-                    size="small"
-                    columns={previewColumns}
-                    dataSource={previewData}
-                    pagination={false}
-                    tableLayout="fixed"
-                    scroll={{ y: 360 }}
-                  />
-                </div>
-
-                <div className="muted" style={{ marginTop: 10 }}>
-                  You can send <span className="mono">rawText</span> to your backend, or normalize rows using the mapping.
-                </div>
-              </div>
-            </div>
-          ) : null}
         </div>
 
         <div className="modalFtr">
           <div className="modalFtr__left muted">
-            {headers.length > 0 ? (
+            {selectedFile ? (
               <>
-                Ready: <b>{canImport ? "Yes" : "No"}</b> - Rows: <b>{rows.length.toLocaleString()}</b>
+                Ready: <b>Yes</b> - File: <b>{selectedFile.name}</b>
               </>
             ) : (
               "Upload a CSV to continue."
@@ -787,26 +548,9 @@ function normalizeDangerHoursMatrix(matrix?: number[][]) {
   );
 }
 
-type HeatmapMode = "bias" | "pnl";
-
-type PnlCalendarEntry = {
-  key: string;
-  date: Date;
-  dayOfMonth: number;
-  pnl: number;
-};
-
 function formatPnlCurrency(value: number) {
   const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
   return value > 0 ? `+${currency.format(value)}` : currency.format(value);
-}
-
-function resolvePnlToneClass(value: number) {
-  const abs = Math.abs(value);
-  const strength = abs >= 450 ? "3" : abs >= 280 ? "2" : abs >= 120 ? "1" : "0";
-  if (value > 0) return `pnlCell--pos${strength}`;
-  if (value < 0) return `pnlCell--neg${strength}`;
-  return "pnlCell--flat";
 }
 
 function resolveDangerCellToneClass(value: number, maxValue: number) {
@@ -833,6 +577,110 @@ const BIAS_LABELS: Record<BiasKey, string> = {
   revenge_trading: "Revenge Trading",
   recency_bias: "Recency Bias",
 };
+
+const BIAS_BAR_CLASS_BY_KEY: Record<BiasKey, string> = {
+  overtrading: "barChart__bar--bias-overtrading",
+  loss_aversion: "barChart__bar--bias-loss-aversion",
+  revenge_trading: "barChart__bar--bias-revenge-trading",
+  recency_bias: "barChart__bar--bias-recency-bias",
+};
+
+const BIAS_KEY_TO_CANONICAL: Record<BiasKey, CanonicalBiasType> = {
+  overtrading: "OVERTRADING",
+  loss_aversion: "LOSS_AVERSION",
+  revenge_trading: "REVENGE_TRADING",
+  recency_bias: "RECENCY_BIAS",
+};
+
+const CANONICAL_BIAS_LABELS: Record<CanonicalBiasType, string> = {
+  OVERTRADING: "Overtrading",
+  LOSS_AVERSION: "Loss Aversion",
+  REVENGE_TRADING: "Revenge Trading",
+  RECENCY_BIAS: "Recency Bias",
+};
+
+const EMOTIONAL_CHECKIN_QUESTIONS: Record<CanonicalBiasType, [string, string, string]> = {
+  REVENGE_TRADING: [
+    "After a loss, do you feel a strong urge to \u2018win it back\u2019 right away?",
+    "When you feel frustrated or embarrassed by a trade, is it harder to pause before taking the next one?",
+    "Do you tend to increase risk when you feel like you\u2019re \u2018behind\u2019 for the day?",
+  ],
+  LOSS_AVERSION: [
+    "Do you avoid closing a losing trade because accepting the loss feels emotionally painful?",
+    "When a trade goes against you, do you keep holding mainly because you hope it will turn around?",
+    "Do you feel more regret from taking a loss than satisfaction from taking a similar-sized gain?",
+  ],
+  RECENCY_BIAS: [
+    "After a recent win or loss streak, do you feel unusually confident or unusually doubtful about the next trade?",
+    "Do your last few trades strongly influence how you size positions right now?",
+    "When the market just moved, do you feel pressure to act quickly so you don\u2019t miss out?",
+  ],
+  OVERTRADING: [
+    "When you\u2019re bored, anxious, or restless, do you trade just to feel engaged?",
+    "Do you feel uneasy when you\u2019re not in a trade, like you\u2019re missing opportunities?",
+    "On stressful days, do you notice you take more trades than you planned, even without clear setups?",
+  ],
+};
+
+function createEmptyCheckinAnswerMap(): Record<CanonicalBiasType, EmotionalCheckInAnswer[]> {
+  return {
+    REVENGE_TRADING: [null, null, null],
+    LOSS_AVERSION: [null, null, null],
+    RECENCY_BIAS: [null, null, null],
+    OVERTRADING: [null, null, null],
+  };
+}
+
+type TopBiasEntry = {
+  biasType: CanonicalBiasType;
+  score: number;
+};
+
+function getTopTwoBiasesFromScores(
+  scores?: AnalysisOutput["bias_scores"]
+): TopBiasEntry[] {
+  if (!scores) return [];
+
+  return (Object.entries(scores) as Array<[BiasKey, number]>)
+    .map(([biasKey, rawScore]) => ({
+      biasType: BIAS_KEY_TO_CANONICAL[biasKey],
+      score: Number.isFinite(rawScore) ? Math.round(rawScore) : 0,
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 2);
+}
+
+function getEmotionalCheckinStorageKey(sessionId: string, biasType: CanonicalBiasType) {
+  return `emotional-checkin:${sessionId}:${biasType}`;
+}
+
+function readStoredBiasAnswers(sessionId: string, biasType: CanonicalBiasType): EmotionalCheckInAnswer[] {
+  try {
+    const raw = window.localStorage.getItem(getEmotionalCheckinStorageKey(sessionId, biasType));
+    if (!raw) return [null, null, null];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [null, null, null];
+
+    return [0, 1, 2].map((idx) => {
+      const value = parsed[idx];
+      return value === "YES" || value === "NO" ? value : null;
+    });
+  } catch {
+    return [null, null, null];
+  }
+}
+
+function writeStoredBiasAnswers(
+  sessionId: string,
+  biasType: CanonicalBiasType,
+  answers: EmotionalCheckInAnswer[]
+) {
+  try {
+    window.localStorage.setItem(getEmotionalCheckinStorageKey(sessionId, biasType), JSON.stringify(answers));
+  } catch {
+    // Ignore localStorage failures (private mode/storage quota)
+  }
+}
 
 function createBiasCounter(): Record<BiasKey, number> {
   return {
@@ -910,10 +758,16 @@ const CHART_GRANULARITY_OPTIONS: Array<{ label: string; value: ChartGranularity 
   { label: "1h", value: "1h" },
   { label: "1d", value: "1d" },
 ];
+const SNAPSHOT_VISIBLE_BUCKETS = 60;
+const SNAPSHOT_LOOKBACK_MULTIPLIER = 2;
 
 type TimelineTradePoint = {
   timestamp: string;
   pnl: number;
+  tradeCount?: number;
+  wins?: number;
+  losses?: number;
+  flat?: number;
 };
 
 type SnapshotBucketSeed = {
@@ -953,7 +807,14 @@ type SnapshotBarDatum = {
   label: string;
   value: number;
   tone?: "neutral" | "positive" | "negative" | "warning";
+  barClassName?: string;
   tooltip: React.ReactNode;
+};
+
+type ChartLegendItem = {
+  key: string;
+  label: string;
+  barClassName: string;
 };
 
 function normalizeConfidencePercent(confidence: unknown): number {
@@ -984,7 +845,8 @@ function parseTimestampToDate(timestamp?: string): Date | null {
 
 function detectDefaultChartGranularity(
   tradeTimeline?: AnalysisOutput["trade_timeline"],
-  flaggedTrades?: AnalysisOutput["flagged_trades"]
+  flaggedTrades?: AnalysisOutput["flagged_trades"],
+  dailyPnl?: AnalysisOutput["daily_pnl"]
 ): ChartGranularity {
   const timelineDates = (tradeTimeline ?? [])
     .map((point) => parseTimestampToDate(point.timestamp))
@@ -994,7 +856,11 @@ function detectDefaultChartGranularity(
     .map((trade) => parseTimestampToDate(trade.timestamp))
     .filter((date): date is Date => date !== null);
 
-  const dates = timelineDates.length > 0 ? timelineDates : fallbackDates;
+  const dailyDates = (dailyPnl ?? [])
+    .map((point) => parseTimestampToDate(`${point.date}T12:00:00`))
+    .filter((date): date is Date => date !== null);
+
+  const dates = timelineDates.length > 0 ? timelineDates : fallbackDates.length > 0 ? fallbackDates : dailyDates;
   if (dates.length < 2) return "1d";
 
   const sorted = [...dates].sort((a, b) => a.getTime() - b.getTime());
@@ -1013,6 +879,11 @@ function resolveBucketStepMinutes(granularity: ChartGranularity) {
   if (granularity === "15m") return 15;
   if (granularity === "1h") return 60;
   return 0;
+}
+
+function resolveBucketStepMs(granularity: ChartGranularity) {
+  if (granularity === "1d") return 24 * 60 * 60 * 1000;
+  return resolveBucketStepMinutes(granularity) * 60 * 1000;
 }
 
 function getSparkBucketKey(date: Date, granularity: ChartGranularity): string {
@@ -1036,28 +907,102 @@ function formatSnapshotBucketLabel(key: string, granularity: ChartGranularity): 
 
 function buildTimelineFromAnalysis(
   tradeTimeline?: AnalysisOutput["trade_timeline"],
-  flaggedTrades?: AnalysisOutput["flagged_trades"]
+  flaggedTrades?: AnalysisOutput["flagged_trades"],
+  dailyPnl?: AnalysisOutput["daily_pnl"]
 ): TimelineTradePoint[] {
   const directTimeline = (tradeTimeline ?? [])
     .filter((point) => typeof point.timestamp === "string" && Number.isFinite(point.pnl))
-    .map((point) => ({ timestamp: point.timestamp, pnl: Number(point.pnl) }));
+    .map((point) => ({
+      timestamp: point.timestamp,
+      pnl: Number(point.pnl),
+      tradeCount:
+        typeof point.trade_count === "number" && Number.isFinite(point.trade_count)
+          ? Math.max(0, Math.round(point.trade_count))
+          : undefined,
+      wins: typeof point.wins === "number" && Number.isFinite(point.wins) ? Math.max(0, Math.round(point.wins)) : undefined,
+      losses:
+        typeof point.losses === "number" && Number.isFinite(point.losses)
+          ? Math.max(0, Math.round(point.losses))
+          : undefined,
+      flat: typeof point.flat === "number" && Number.isFinite(point.flat) ? Math.max(0, Math.round(point.flat)) : undefined,
+    }));
 
   if (directTimeline.length > 0) {
-    return directTimeline.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    // Timeline is already sorted when normalized in the API client.
+    return directTimeline;
   }
 
-  return (flaggedTrades ?? [])
+  const fromFlaggedTrades = (flaggedTrades ?? [])
     .filter((trade) => typeof trade.timestamp === "string" && Number.isFinite(trade.profit_loss))
-    .map((trade) => ({ timestamp: trade.timestamp!, pnl: Number(trade.profit_loss ?? 0) }))
+    .map((trade) => ({ timestamp: trade.timestamp!, pnl: Number(trade.profit_loss ?? 0), tradeCount: 1 }))
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  if (fromFlaggedTrades.length > 0) return fromFlaggedTrades;
+
+  return (dailyPnl ?? [])
+    .map((point) => ({ timestamp: `${point.date}T12:00:00`, pnl: Number(point.pnl), tradeCount: 1 }))
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
+type SelectedTimelineWindow = {
+  points: TimelineTradePoint[];
+  cutoffMs: number | null;
+};
+
+function selectRecentTimelineWindow(
+  source: TimelineTradePoint[],
+  granularity: ChartGranularity,
+  maxBuckets: number,
+  lookbackMultiplier: number
+): SelectedTimelineWindow {
+  if (source.length === 0) return { points: source, cutoffMs: null };
+
+  const safeBuckets = Math.max(1, Math.floor(maxBuckets));
+  const safeMultiplier = Math.max(1, lookbackMultiplier);
+  const lookbackMs = resolveBucketStepMs(granularity) * safeBuckets * safeMultiplier;
+
+  let latestMs: number | null = null;
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    const parsed = parseTimestampToDate(source[index].timestamp);
+    if (!parsed) continue;
+    latestMs = parsed.getTime();
+    break;
+  }
+
+  if (latestMs === null) {
+    return { points: source.slice(-safeBuckets), cutoffMs: null };
+  }
+
+  const cutoffMs = latestMs - lookbackMs;
+  const selected: TimelineTradePoint[] = [];
+
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    const point = source[index];
+    const parsed = parseTimestampToDate(point.timestamp);
+    if (!parsed) continue;
+    if (parsed.getTime() < cutoffMs) break;
+    selected.push(point);
+  }
+
+  if (selected.length === 0) {
+    return { points: source.slice(-safeBuckets), cutoffMs };
+  }
+
+  selected.reverse();
+  return { points: selected, cutoffMs };
 }
 
 function buildSnapshotBuckets(
   tradeTimeline?: AnalysisOutput["trade_timeline"],
   flaggedTrades?: AnalysisOutput["flagged_trades"],
-  granularity: ChartGranularity = "1h"
+  dailyPnl?: AnalysisOutput["daily_pnl"],
+  granularity: ChartGranularity = "1h",
+  maxBuckets: number = SNAPSHOT_VISIBLE_BUCKETS,
+  lookbackMultiplier: number = SNAPSHOT_LOOKBACK_MULTIPLIER
 ) : SnapshotBucket[] {
-  const source = buildTimelineFromAnalysis(tradeTimeline, flaggedTrades);
+  const rawSource = buildTimelineFromAnalysis(tradeTimeline, flaggedTrades, dailyPnl);
+  const selectedWindow = selectRecentTimelineWindow(rawSource, granularity, maxBuckets, lookbackMultiplier);
+  const source = selectedWindow.points;
+  const cutoffMs = selectedWindow.cutoffMs;
   const bucketMap = new Map<string, SnapshotBucketSeed>();
   let fallbackTimelineIndex = 0;
   let fallbackFlaggedIndex = 0;
@@ -1087,15 +1032,34 @@ function buildSnapshotBuckets(
       ? getSparkBucketKey(parsed, granularity)
       : `zz-unknown-t-${String(fallbackTimelineIndex++).padStart(5, "0")}`;
     const bucket = ensureBucket(key);
-    bucket.trades += 1;
+    const tradeCount = Math.max(1, Math.round(point.tradeCount ?? 1));
+    let winCount = point.wins ?? 0;
+    let lossCount = point.losses ?? 0;
+    let flatCount = point.flat ?? 0;
+    const hasDetailedCounts = point.wins != null || point.losses != null || point.flat != null;
+    if (!hasDetailedCounts) {
+      winCount = point.pnl > 0 ? tradeCount : 0;
+      lossCount = point.pnl < 0 ? tradeCount : 0;
+      flatCount = point.pnl === 0 ? tradeCount : 0;
+    } else {
+      winCount = Math.max(0, Math.round(winCount));
+      lossCount = Math.max(0, Math.round(lossCount));
+      flatCount = Math.max(0, Math.round(flatCount));
+      const known = winCount + lossCount + flatCount;
+      if (known < tradeCount) {
+        flatCount += tradeCount - known;
+      }
+    }
+    bucket.trades += tradeCount;
     bucket.pnl += Number(point.pnl);
-    if (point.pnl > 0) bucket.wins += 1;
-    else if (point.pnl < 0) bucket.losses += 1;
-    else bucket.flat += 1;
+    bucket.wins += winCount;
+    bucket.losses += lossCount;
+    bucket.flat += flatCount;
   }
 
   for (const trade of flaggedTrades ?? []) {
     const parsed = parseTimestampToDate(trade.timestamp);
+    if (cutoffMs !== null && parsed && parsed.getTime() < cutoffMs) continue;
     const key = parsed
       ? getSparkBucketKey(parsed, granularity)
       : `zz-unknown-f-${String(fallbackFlaggedIndex++).padStart(5, "0")}`;
@@ -1112,10 +1076,11 @@ function buildSnapshotBuckets(
   }
 
   const ordered = [...bucketMap.values()].sort((a, b) => a.key.localeCompare(b.key));
+  const boundedOrdered = ordered.length > maxBuckets ? ordered.slice(-maxBuckets) : ordered;
   const output: SnapshotBucket[] = [];
   let cumulativePnl = 0;
 
-  for (const bucket of ordered) {
+  for (const bucket of boundedOrdered) {
     cumulativePnl += bucket.pnl;
     const avgConfidence = bucket.flaggedTrades > 0 ? bucket.confidenceSum / bucket.flaggedTrades : 0;
     const biasIncidents = Object.values(bucket.biasCounters).reduce((sum, value) => sum + value, 0);
@@ -1144,40 +1109,6 @@ function buildSnapshotBuckets(
   return output;
 }
 
-function buildDailyPnlSeries(
-  dailyPnl?: AnalysisOutput["daily_pnl"],
-  tradeTimeline?: AnalysisOutput["trade_timeline"],
-  flaggedTrades?: AnalysisOutput["flagged_trades"]
-): AnalysisOutput["daily_pnl"] {
-  const normalizedDailyMap = new Map<string, number>();
-  if (Array.isArray(dailyPnl)) {
-    for (const point of dailyPnl) {
-      if (!point || typeof point.date !== "string" || !Number.isFinite(point.pnl)) continue;
-      const dateKey = point.date.slice(0, 10);
-      if (!dateKey) continue;
-      normalizedDailyMap.set(dateKey, (normalizedDailyMap.get(dateKey) ?? 0) + Number(point.pnl));
-    }
-  }
-
-  if (normalizedDailyMap.size > 0) {
-    return [...normalizedDailyMap.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, pnl]) => ({ date, pnl: Number(pnl.toFixed(2)) }));
-  }
-
-  const timeline = buildTimelineFromAnalysis(tradeTimeline, flaggedTrades);
-  const fallbackMap = new Map<string, number>();
-  for (const point of timeline) {
-    const parsed = parseTimestampToDate(point.timestamp);
-    if (!parsed) continue;
-    const dateKey = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
-    fallbackMap.set(dateKey, (fallbackMap.get(dateKey) ?? 0) + Number(point.pnl));
-  }
-
-  return [...fallbackMap.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, pnl]) => ({ date, pnl: Number(pnl.toFixed(2)) }));
-}
 
 function formatCompactUsd(value: number) {
   if (!Number.isFinite(value)) return "$0";
@@ -1202,125 +1133,6 @@ function formatChartAxisValue(value: number) {
   return `${sign}${abs.toFixed(3)}`;
 }
 
-function buildMonthlyPnlCalendar(
-  referenceDate: Date,
-  dailyPnl?: AnalysisOutput["daily_pnl"]
-): Array<PnlCalendarEntry | null> {
-  const year = referenceDate.getFullYear();
-  const month = referenceDate.getMonth();
-  const firstDay = new Date(year, month, 1);
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const mondayFirstOffset = (firstDay.getDay() + 6) % 7; // convert Sunday=0 to Monday-last layout
-
-  const monthPnlByDay = new Map<number, number>();
-  if (Array.isArray(dailyPnl) && dailyPnl.length > 0) {
-    for (const point of dailyPnl) {
-      if (!point?.date) continue;
-      const parsed = new Date(`${point.date}T00:00:00`);
-      if (Number.isNaN(parsed.getTime())) continue;
-      if (parsed.getFullYear() !== year || parsed.getMonth() !== month) continue;
-      monthPnlByDay.set(parsed.getDate(), point.pnl);
-    }
-  }
-
-  const hasBackendPnl = monthPnlByDay.size > 0;
-  const entries: Array<PnlCalendarEntry | null> = [];
-
-  for (let i = 0; i < mondayFirstOffset; i++) {
-    entries.push(null);
-  }
-
-  for (let day = 1; day <= daysInMonth; day++) {
-    const date = new Date(year, month, day);
-    const weekday = (date.getDay() + 6) % 7;
-
-    const pnl = hasBackendPnl
-      ? Math.round(monthPnlByDay.get(day) ?? 0)
-      : Math.round(Math.sin(day * 0.82) * 245 + (2 - weekday) * 34 + (day % 5 === 0 ? -92 : 74));
-
-    entries.push({
-      key: date.toISOString(),
-      date,
-      dayOfMonth: day,
-      pnl,
-    });
-  }
-
-  while (entries.length % 7 !== 0) {
-    entries.push(null);
-  }
-
-  return entries;
-}
-
-function buildLocalFallbackAnalysis(): AnalysisOutput {
-  return {
-    behavior_index: 75,
-    bias_scores: {
-      overtrading: 72,
-      loss_aversion: 79,
-      revenge_trading: 86,
-      recency_bias: 45,
-    },
-    top_triggers: ["Rapid re-entry after loss", "Oversize after drawdown", "Trade clustering in open hour"],
-    danger_hours: normalizeDangerHoursMatrix(DANGER_MATRIX),
-    daily_pnl: [],
-    trade_timeline: [
-      { timestamp: "2024-03-31T10:41:00", pnl: 228 },
-      { timestamp: "2024-03-31T11:03:00", pnl: -78 },
-      { timestamp: "2024-03-31T13:58:00", pnl: -312 },
-    ],
-    flagged_trades: [
-      {
-        trade_id: "T-19321",
-        timestamp: "10:41",
-        symbol: "TSLA",
-        bias: "revenge_trading",
-        confidence: 0.86,
-        evidence: ["Re-entry in under 90 seconds", "Size above rolling median"],
-      },
-      {
-        trade_id: "T-19322",
-        timestamp: "11:03",
-        symbol: "AAPL",
-        bias: "overtrading",
-        confidence: 0.72,
-        evidence: ["Trade burst in 10-minute window", "Low hold-time percentile"],
-      },
-      {
-        trade_id: "T-19323",
-        timestamp: "13:58",
-        symbol: "NVDA",
-        bias: "loss_aversion",
-        confidence: 0.79,
-        evidence: ["Loss held far above personal median", "Discipline drift in stop behavior"],
-      },
-    ],
-    explainability: {
-      overtrading: [
-        { feature: "trades_10m", contribution: 0.31, direction: "positive", detail: "Trade frequency above baseline" },
-        { feature: "median_hold_min", contribution: -0.12, direction: "negative", detail: "Hold time compressed" },
-      ],
-      loss_aversion: [
-        { feature: "loss_hold_percentile", contribution: 0.37, direction: "positive", detail: "Losses held longer" },
-        { feature: "stop_override_rate", contribution: 0.19, direction: "positive", detail: "Stops overridden" },
-      ],
-      revenge_trading: [
-        {
-          feature: "reentry_seconds_after_loss",
-          contribution: 0.42,
-          direction: "positive",
-          detail: "Rapid re-entry after negative outcome",
-        },
-        { feature: "post_loss_size_ratio", contribution: 0.22, direction: "positive", detail: "Size increases post-loss" },
-      ],
-      recency_bias: [
-        { feature: "short_term_trades", contribution: 0.35, direction: "positive", detail: "Recent trades cluster tightly" },
-        { feature: "recent_pnl_influence", contribution: 0.28, direction: "positive", detail: "Recent wins affect position sizing" },
-      ],
-    },
-  };
-}
 
 function SnapshotTooltipContent({
   title,
@@ -1355,12 +1167,14 @@ function BarChartCard({
   title,
   value,
   bars,
+  legend,
   valueTone,
   size = "compact",
 }: {
   title: string;
   value: string;
   bars: SnapshotBarDatum[];
+  legend?: ChartLegendItem[];
   valueTone?: "pos" | "neg";
   size?: "compact" | "large";
 }) {
@@ -1414,8 +1228,9 @@ function BarChartCard({
               const safeValue = Number.isFinite(bar.value) ? bar.value : 0;
               const ratio = Math.min(Math.abs(safeValue) / scaleMax, 1);
               const normalizedHeight = Math.max((hasNegative ? halfTrackHeight : fullTrackHeight) * ratio, safeValue === 0 ? 2 : 0);
-              const toneClass =
-                bar.tone === "neutral"
+              const toneClass = bar.barClassName
+                ? bar.barClassName
+                : bar.tone === "neutral"
                   ? "barChart__bar--neutral"
                   : bar.tone === "warning"
                     ? "barChart__bar--warn"
@@ -1435,7 +1250,7 @@ function BarChartCard({
               return (
                 <AntTooltip
                   key={bar.key}
-                  overlayClassName="barChartTooltip"
+                  classNames={{ root: "barChartTooltip" }}
                   title={bar.tooltip}
                   placement="top"
                 >
@@ -1458,6 +1273,17 @@ function BarChartCard({
           {firstLabel} - {lastLabel}
         </span>
       </div>
+
+      {legend && legend.length > 0 ? (
+        <div className="barChartLegend">
+          {legend.map((item) => (
+            <span key={item.key} className="barChartLegend__item">
+              <span className={cn("barChartLegend__swatch", item.barClassName)} />
+              <span className="barChartLegend__label">{item.label}</span>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1468,6 +1294,7 @@ type SnapshotChartCardModel = {
   value: string;
   valueTone?: "pos" | "neg";
   bars: SnapshotBarDatum[];
+  legend?: ChartLegendItem[];
 };
 
 type SnapshotChartBundle = {
@@ -1477,23 +1304,28 @@ type SnapshotChartBundle = {
 type SnapshotAnalysisLike = {
   trade_timeline?: AnalysisOutput["trade_timeline"];
   flagged_trades?: AnalysisOutput["flagged_trades"];
+  daily_pnl?: AnalysisOutput["daily_pnl"];
   summary?: AnalysisOutput["summary"];
 };
 
 function buildSnapshotChartBundle(
   analysis: SnapshotAnalysisLike | null | undefined,
-  granularity: ChartGranularity
+  granularity: ChartGranularity,
+  maxBuckets: number = SNAPSHOT_VISIBLE_BUCKETS
 ): SnapshotChartBundle {
-  const snapshotBuckets = buildSnapshotBuckets(analysis?.trade_timeline, analysis?.flagged_trades, granularity);
+  const snapshotBuckets = buildSnapshotBuckets(
+    analysis?.trade_timeline,
+    analysis?.flagged_trades,
+    analysis?.daily_pnl,
+    granularity,
+    maxBuckets,
+  );
   const summaryTotalTrades = analysis?.summary?.total_trades;
   const summaryTotalPnl = analysis?.summary?.total_pnl;
   const totalTradesFromBuckets = snapshotBuckets.reduce((sum, bucket) => sum + bucket.trades, 0);
   const totalPnlFromBuckets = snapshotBuckets.reduce((sum, bucket) => sum + bucket.pnl, 0);
-  const totalConfidenceSum = snapshotBuckets.reduce((sum, bucket) => sum + bucket.confidenceSum, 0);
-  const totalFlaggedTrades = snapshotBuckets.reduce((sum, bucket) => sum + bucket.flaggedTrades, 0);
   const totalWins = snapshotBuckets.reduce((sum, bucket) => sum + bucket.wins, 0);
   const totalBiasIncidents = snapshotBuckets.reduce((sum, bucket) => sum + bucket.biasIncidents, 0);
-  const avgConfidence = totalFlaggedTrades > 0 ? totalConfidenceSum / totalFlaggedTrades : 0;
   const totalTrades =
     typeof summaryTotalTrades === "number" && Number.isFinite(summaryTotalTrades)
       ? Math.round(summaryTotalTrades)
@@ -1528,24 +1360,6 @@ function buildSnapshotChartBundle(
             value: bucket.flaggedTrades > 0 ? `${bucket.avgConfidence.toFixed(1)}%` : "No flags",
             tone: bucket.flaggedTrades > 0 ? undefined : "warn",
           },
-        ]}
-      />
-    ),
-  }));
-
-  const tradesConfidenceBars: SnapshotBarDatum[] = snapshotBuckets.map((bucket) => ({
-    key: `confidence-${bucket.key}`,
-    label: bucket.label,
-    value: bucket.weightedConfidenceTrades,
-    tone: "positive",
-    tooltip: (
-      <SnapshotTooltipContent
-        title={bucket.key}
-        rows={[
-          { label: "Weighted score", value: bucket.weightedConfidenceTrades.toFixed(2) },
-          { label: "Avg confidence", value: `${bucket.avgConfidence.toFixed(1)}%` },
-          { label: "Flagged trades", value: bucket.flaggedTrades.toLocaleString() },
-          { label: "Total trades", value: bucket.trades.toLocaleString() },
         ]}
       />
     ),
@@ -1599,7 +1413,11 @@ function buildSnapshotChartBundle(
       key: `bias-${bucket.key}`,
       label: bucket.label,
       value: bucket.biasIncidents,
-      tone: bucket.biasIncidents > 0 ? "warning" : "neutral",
+      tone: bucket.biasIncidents > 0 ? undefined : "neutral",
+      barClassName:
+        bucket.biasIncidents > 0 && bucket.dominantBias
+          ? BIAS_BAR_CLASS_BY_KEY[bucket.dominantBias]
+          : "barChart__bar--neutral",
       tooltip: (
         <SnapshotTooltipContent
           title={bucket.key}
@@ -1614,6 +1432,12 @@ function buildSnapshotChartBundle(
     };
   });
 
+  const biasLegend: ChartLegendItem[] = (Object.keys(BIAS_LABELS) as BiasKey[]).map((biasKey) => ({
+    key: `legend-${biasKey}`,
+    label: BIAS_LABELS[biasKey],
+    barClassName: BIAS_BAR_CLASS_BY_KEY[biasKey],
+  }));
+
   return {
     cards: [
       {
@@ -1621,12 +1445,6 @@ function buildSnapshotChartBundle(
         title: "Trade Frequency",
         value: `${totalTrades.toLocaleString()} total`,
         bars: tradeFrequencyBars,
-      },
-      {
-        id: "confidence",
-        title: "Trades + Confidence",
-        value: `${totalTrades.toLocaleString()} | ${Math.round(avgConfidence)}%`,
-        bars: tradesConfidenceBars,
       },
       {
         id: "realized_pnl",
@@ -1647,25 +1465,24 @@ function buildSnapshotChartBundle(
         title: "Bias Incidents",
         value: `${totalBiasIncidents.toLocaleString()} tags`,
         bars: biasIncidentsBars,
+        legend: biasLegend,
       },
     ],
   };
 }
 
 const COMMAND_SNAPSHOT_CARD_IDS = [
-  "trade_frequency",
-  "confidence",
   "realized_pnl",
+  "trade_frequency",
   "win_rate",
   "bias_incidents",
 ] as const;
-const COMMAND_SNAPSHOT_MAX_BUCKETS = 60;
 
 function buildCommandSnapshotCards(
   analysis: SnapshotAnalysisLike | null | undefined,
   granularity: ChartGranularity
 ): SnapshotChartCardModel[] {
-  const cards = buildSnapshotChartBundle(analysis, granularity).cards;
+  const cards = buildSnapshotChartBundle(analysis, granularity, SNAPSHOT_VISIBLE_BUCKETS).cards;
   const cardsById = new Map(cards.map((card) => [card.id, card] as const));
 
   return COMMAND_SNAPSHOT_CARD_IDS.map((id) => {
@@ -1673,119 +1490,325 @@ function buildCommandSnapshotCards(
     if (!card) return null;
     return {
       ...card,
-      bars: card.bars.slice(-COMMAND_SNAPSHOT_MAX_BUCKETS),
+      bars: card.bars.slice(-SNAPSHOT_VISIBLE_BUCKETS),
     };
   }).filter((card): card is SnapshotChartCardModel => card !== null);
 }
 
-function SnapshotChartsCarousel({
+type PnlSeriesPoint = {
+  key: string;
+  label: string;
+  periodPnl: number;
+  cumulativePnl: number;
+};
+
+function buildYearMonthSeries(
+  year: number,
+  monthPnlByKey: Map<string, number>
+): PnlSeriesPoint[] {
+  const yearStart = startOfYear(new Date(year, 0, 1));
+  const yearEnd = endOfYear(yearStart);
+  let cumulative = 0;
+
+  return Array.from({ length: 12 }, (_, monthIndex) => {
+    const monthDate = new Date(year, monthIndex, 1);
+    if (monthDate < yearStart || monthDate > yearEnd) {
+      return {
+        key: `${year}-${String(monthIndex + 1).padStart(2, "0")}`,
+        label: formatDate(monthDate, "MMM"),
+        periodPnl: 0,
+        cumulativePnl: Number(cumulative.toFixed(2)),
+      };
+    }
+
+    const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+    const periodPnl = Number((monthPnlByKey.get(monthKey) ?? 0).toFixed(2));
+    cumulative += periodPnl;
+    return {
+      key: monthKey,
+      label: formatDate(monthDate, "MMM"),
+      periodPnl,
+      cumulativePnl: Number(cumulative.toFixed(2)),
+    };
+  });
+}
+
+function PnlChartCard({
+  card,
   analysis,
-  granularity,
-  onGranularityChange,
-  size = "compact",
 }: {
-  analysis: SnapshotAnalysisLike | null | undefined;
-  granularity: ChartGranularity;
-  onGranularityChange: (next: ChartGranularity) => void;
-  size?: "compact" | "large";
+  card: SnapshotChartCardModel;
+  analysis?: AnalysisOutput | null;
 }) {
-  const bundle = buildSnapshotChartBundle(analysis, granularity);
-  const cards = bundle.cards;
-  const [activeIndex, setActiveIndex] = useState(0);
-  const carouselRef = useRef<any>(null);
-  const isLarge = size === "large";
+  const [viewMode, setViewMode] = useState<"granularity" | "calendar">("granularity");
+  const [calendarMode, setCalendarMode] = useState<PnlCalendarMode>("month");
+
+  const timelinePoints = useMemo(
+    () => buildTimelineFromAnalysis(analysis?.trade_timeline, analysis?.flagged_trades, analysis?.daily_pnl),
+    [analysis?.trade_timeline, analysis?.flagged_trades, analysis?.daily_pnl]
+  );
+
+  const latestParsedTimestamp = useMemo(() => {
+    for (let index = timelinePoints.length - 1; index >= 0; index -= 1) {
+      const raw = timelinePoints[index]?.timestamp;
+      if (!raw) continue;
+      const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+      const parsedFromIso = parseISO(normalized);
+      if (!Number.isNaN(parsedFromIso.getTime())) return parsedFromIso;
+      const fallback = parseTimestampToDate(raw);
+      if (fallback) return fallback;
+    }
+    return new Date();
+  }, [timelinePoints]);
+
+  const [calendarValue, setCalendarValue] = useState<PnlCalendarValue>(() => ({
+    year: latestParsedTimestamp.getFullYear(),
+    month: latestParsedTimestamp.getMonth(),
+  }));
 
   useEffect(() => {
-    setActiveIndex(0);
-    if (carouselRef.current) carouselRef.current.goTo(0, true);
-  }, [granularity, cards.length]);
+    setCalendarValue({
+      year: latestParsedTimestamp.getFullYear(),
+      month: latestParsedTimestamp.getMonth(),
+    });
+  }, [latestParsedTimestamp]);
+
+  const dailyPnlByDateKey = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const point of timelinePoints) {
+      const rawTimestamp = point.timestamp;
+      const normalized = rawTimestamp.includes("T") ? rawTimestamp : rawTimestamp.replace(" ", "T");
+      const parsedFromIso = parseISO(normalized);
+      const parsed = !Number.isNaN(parsedFromIso.getTime()) ? parsedFromIso : parseTimestampToDate(rawTimestamp);
+      if (!parsed) continue;
+
+      const dayKey = formatDate(startOfDay(parsed), "yyyy-MM-dd");
+      map.set(dayKey, Number((map.get(dayKey) ?? 0) + point.pnl));
+    }
+    return map;
+  }, [timelinePoints]);
+
+  const monthPnlByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const [dayKey, pnl] of dailyPnlByDateKey.entries()) {
+      const monthKey = dayKey.slice(0, 7);
+      map.set(monthKey, Number((map.get(monthKey) ?? 0) + pnl));
+    }
+    return map;
+  }, [dailyPnlByDateKey]);
+
+  const availableYears = useMemo(() => {
+    const years = new Set<number>();
+    for (const dayKey of dailyPnlByDateKey.keys()) {
+      const year = Number(dayKey.slice(0, 4));
+      if (Number.isFinite(year)) years.add(year);
+    }
+
+    if (years.size === 0) {
+      years.add(latestParsedTimestamp.getFullYear());
+    }
+
+    return [...years].sort((a, b) => a - b);
+  }, [dailyPnlByDateKey, latestParsedTimestamp]);
+
+  useEffect(() => {
+    if (availableYears.length === 0) return;
+    if (!availableYears.includes(calendarValue.year)) {
+      const fallbackYear = availableYears[availableYears.length - 1];
+      setCalendarValue((previous) => ({
+        ...previous,
+        year: fallbackYear,
+      }));
+    }
+  }, [availableYears, calendarValue.year]);
+
+  const granularitySeries = useMemo<PnlSeriesPoint[]>(() => {
+    let cumulative = 0;
+    return (card.bars ?? []).map((bar) => {
+      const periodPnl = Number((bar.value ?? 0).toFixed(2));
+      cumulative += periodPnl;
+      return {
+        key: bar.key,
+        label: bar.label,
+        periodPnl,
+        cumulativePnl: Number(cumulative.toFixed(2)),
+      };
+    });
+  }, [card.bars]);
+
+  const calendarSeries = useMemo<PnlSeriesPoint[]>(() => {
+    if (calendarMode === "year") {
+      return buildYearMonthSeries(calendarValue.year, monthPnlByKey);
+    }
+
+    const safeMonth = Math.max(0, Math.min(11, calendarValue.month ?? latestParsedTimestamp.getMonth()));
+    const monthDate = new Date(calendarValue.year, safeMonth, 1);
+    const start = startOfMonth(monthDate);
+    const end = endOfMonth(monthDate);
+    const dayRange = eachDayOfInterval({ start, end });
+    let cumulative = 0;
+
+    return dayRange.map((day) => {
+      const dayKey = formatDate(day, "yyyy-MM-dd");
+      const periodPnl = Number((dailyPnlByDateKey.get(dayKey) ?? 0).toFixed(2));
+      cumulative += periodPnl;
+      return {
+        key: dayKey,
+        label: formatDate(day, "d"),
+        periodPnl,
+        cumulativePnl: Number(cumulative.toFixed(2)),
+      };
+    });
+  }, [calendarMode, calendarValue, dailyPnlByDateKey, latestParsedTimestamp, monthPnlByKey]);
+
+  const activeSeries = viewMode === "calendar" ? calendarSeries : granularitySeries;
+  const hasActiveTrades = activeSeries.some((point) => point.periodPnl !== 0);
+  const periodTotal = activeSeries.reduce((sum, point) => sum + point.periodPnl, 0);
+  const periodLabel =
+    viewMode === "calendar"
+      ? calendarMode === "month"
+        ? formatDate(new Date(calendarValue.year, calendarValue.month ?? 0, 1), "MMM yyyy")
+        : `Year ${calendarValue.year}`
+      : "Selected granularity";
 
   return (
-    <div className={cn("snapshotCarousel", isLarge && "snapshotCarousel--large")}>
-      <div className="snapshotControls">
-        <AntSegmented
-          className="chartGranularityTabs"
-          value={granularity}
-          onChange={(value) => onGranularityChange(value as ChartGranularity)}
-          options={CHART_GRANULARITY_OPTIONS}
-        />
-        <div className="snapshotCarousel__controls">
-          <AntButton
-            className="snapshotCarousel__arrow"
-            type="text"
-            icon={<LeftOutlined />}
-            onClick={() => carouselRef.current?.prev()}
-            disabled={cards.length <= 1}
-            aria-label="Previous chart"
-          />
-          <span className="snapshotCarousel__counter mono">
-            {cards.length > 0 ? activeIndex + 1 : 0}/{cards.length}
-          </span>
-          <AntButton
-            className="snapshotCarousel__arrow"
-            type="text"
-            icon={<RightOutlined />}
-            onClick={() => carouselRef.current?.next()}
-            disabled={cards.length <= 1}
-            aria-label="Next chart"
-          />
-        </div>
+    <div className="sparkCard barCard pnlRechartsCard">
+      <div className="sparkCard__meta">
+        <span>{card.title}</span>
+        <span className={cn("mono", periodTotal >= 0 ? "pos" : "neg")}>{formatCompactUsd(periodTotal)}</span>
       </div>
 
-      <AntCarousel ref={carouselRef} dots={{ className: "snapshotCarousel__dots" }} afterChange={setActiveIndex}>
-        {cards.map((card) => (
-          <div key={card.id} className="snapshotCarousel__slide">
-            <BarChartCard
-              title={card.title}
-              value={card.value}
-              valueTone={card.valueTone}
-              bars={card.bars}
-              size={size}
+      <div className="pnlChartHeader">
+        <TabsPrimitive.Root
+          value={viewMode}
+          onValueChange={(next) => setViewMode(next as "granularity" | "calendar")}
+          className="pnlViewTabs"
+        >
+          <TabsPrimitive.List className="pnlViewTabs__list" aria-label="PnL view mode">
+            <TabsPrimitive.Trigger className="pnlViewTabs__trigger" value="granularity">
+              Granularity
+            </TabsPrimitive.Trigger>
+            <TabsPrimitive.Trigger className="pnlViewTabs__trigger" value="calendar">
+              Calendar
+            </TabsPrimitive.Trigger>
+          </TabsPrimitive.List>
+        </TabsPrimitive.Root>
+
+        {viewMode === "calendar" ? (
+          <div className="pnlCalendarHeader">
+            <TabsPrimitive.Root
+              value={calendarMode}
+              onValueChange={(next) => setCalendarMode(next as PnlCalendarMode)}
+              className="pnlSubTabs"
+            >
+              <TabsPrimitive.List className="pnlSubTabs__list" aria-label="Calendar mode">
+                <TabsPrimitive.Trigger className="pnlSubTabs__trigger" value="month">
+                  Month
+                </TabsPrimitive.Trigger>
+                <TabsPrimitive.Trigger className="pnlSubTabs__trigger" value="year">
+                  Year
+                </TabsPrimitive.Trigger>
+              </TabsPrimitive.List>
+            </TabsPrimitive.Root>
+
+            <PnlCalendarControl
+              mode={calendarMode}
+              value={calendarValue}
+              onChange={setCalendarValue}
+              minYear={Math.min(...availableYears)}
+              maxYear={Math.max(...availableYears)}
             />
           </div>
-        ))}
-      </AntCarousel>
+        ) : null}
+      </div>
+
+      <div className="pnlChartCaption muted mono">{periodLabel}</div>
+
+      <div className="pnlRechartsFrame">
+        <ResponsiveContainer width="100%" height={220}>
+          <RechartsComposedChart data={activeSeries} margin={{ top: 12, right: 18, bottom: 8, left: 4 }}>
+            <RechartsCartesianGrid strokeDasharray="3 3" stroke="rgba(120, 142, 172, 0.18)" />
+            <RechartsXAxis
+              dataKey="label"
+              tickLine={false}
+              axisLine={false}
+              stroke="rgba(180, 197, 220, 0.9)"
+              minTickGap={viewMode === "calendar" && calendarMode === "month" ? 10 : 20}
+            />
+            <RechartsYAxis
+              yAxisId="left"
+              tickLine={false}
+              axisLine={false}
+              width={48}
+              stroke="rgba(180, 197, 220, 0.9)"
+              tickFormatter={(value) => formatChartAxisValue(Number(value))}
+            />
+            <RechartsYAxis
+              yAxisId="right"
+              orientation="right"
+              tickLine={false}
+              axisLine={false}
+              width={56}
+              stroke="rgba(160, 188, 230, 0.88)"
+              tickFormatter={(value) => formatChartAxisValue(Number(value))}
+            />
+            <RechartsTooltip
+              cursor={{ fill: "rgba(255,255,255,0.06)" }}
+              formatter={(value: number, name: string) => [
+                formatPnlCurrency(Number(value)),
+                name === "periodPnl" ? "Period PnL" : "Cumulative PnL",
+              ]}
+              labelFormatter={(label) => `Bucket ${label}`}
+              contentStyle={{
+                background: "rgba(6,10,16,.97)",
+                border: "1px solid rgba(255,255,255,.14)",
+                borderRadius: "10px",
+              }}
+            />
+            <RechartsBar
+              yAxisId="left"
+              dataKey="periodPnl"
+              name="periodPnl"
+              fill="rgba(47,232,199,.88)"
+              radius={[4, 4, 0, 0]}
+            />
+            <RechartsLine
+              yAxisId="right"
+              type="monotone"
+              dataKey="cumulativePnl"
+              name="cumulativePnL"
+              stroke="rgba(124, 168, 255, .98)"
+              strokeWidth={2}
+              dot={false}
+            />
+          </RechartsComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      {viewMode === "calendar" && !hasActiveTrades ? (
+        <div className="pnlChartEmpty muted">No trades in this period.</div>
+      ) : null}
     </div>
   );
 }
 
 function DangerHeatmap({
   dangerHours,
-  dailyPnl,
-  tradeTimeline,
   biasScores,
   topTriggers,
   flaggedTrades,
   explainability,
 }: {
   dangerHours?: number[][];
-  dailyPnl?: AnalysisOutput["daily_pnl"];
-  tradeTimeline?: AnalysisOutput["trade_timeline"];
   biasScores?: AnalysisOutput["bias_scores"];
   topTriggers?: string[];
   flaggedTrades?: AnalysisOutput["flagged_trades"];
   explainability?: AnalysisOutput["explainability"];
 }) {
-  const [mode, setMode] = useState<HeatmapMode>("bias");
   const hasBiasHeatmapData =
     Array.isArray(dangerHours) &&
     dangerHours.length > 0 &&
     dangerHours.some((row) => Array.isArray(row) && row.some((value) => Number.isFinite(value)));
-  const normalizedDailyPnl = buildDailyPnlSeries(dailyPnl, tradeTimeline, flaggedTrades);
-  const hasPnlHeatmapData = normalizedDailyPnl.length > 0;
-  const hasAnyHeatmapData = hasBiasHeatmapData || hasPnlHeatmapData;
-
-  const latestPnlDate = (() => {
-    if (!hasPnlHeatmapData) return null;
-    const parsedDates = normalizedDailyPnl
-      .map((point) => new Date(`${point.date}T00:00:00`))
-      .filter((date) => !Number.isNaN(date.getTime()))
-      .sort((a, b) => a.getTime() - b.getTime());
-    return parsedDates.length ? parsedDates[parsedDates.length - 1] : null;
-  })();
-  const referenceDate = latestPnlDate ?? new Date();
-  const monthYearLabel = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric" }).format(referenceDate);
-  const pnlCalendar = buildMonthlyPnlCalendar(referenceDate, normalizedDailyPnl);
   const normalizedDangerMatrix = normalizeDangerHoursMatrix(dangerHours);
   const maxDangerCount = normalizedDangerMatrix.reduce((max, row) => {
     const marketHourMax = DANGER_MARKET_HOUR_INDEXES.reduce((rowMax, hourIdx) => Math.max(rowMax, row[hourIdx]), 0);
@@ -1896,7 +1919,7 @@ function DangerHeatmap({
         );
 
         return (
-          <AntTooltip title={tooltipTitle} overlayClassName="dangerCellTooltip" placement="top">
+          <AntTooltip title={tooltipTitle} classNames={{ root: "dangerCellTooltip" }} placement="top">
             <span className={cn("dangerCell", resolveDangerCellToneClass(cell, maxDangerCount))} />
           </AntTooltip>
         );
@@ -1915,47 +1938,24 @@ function DangerHeatmap({
     return record;
   });
 
-  const heatmapTitle =
-    mode === "bias" ? "Behavior Risk Heatmap (Weekday x Hour)" : "Realized PnL Calendar (Day x Week)";
-  const heatmapAxisHint =
-    mode === "bias"
-      ? "Y-axis: weekday (Mon-Sun) | X-axis: market hour bucket (09-17, local time)"
-      : "Y-axis: week of month | X-axis: weekday (Mon-Sun)";
-
   return (
     <div>
       <div className="heatmapHdr">
         <div>
-          <div className="heatmapHdr__title">{heatmapTitle}</div>
-          <div className="heatmapHdr__axis muted">{heatmapAxisHint}</div>
-          <div className="muted">
-            {hasPnlHeatmapData ? `Month: ${monthYearLabel}` : "Import a CSV to generate heatmap data."}
+          <div className="heatmapHdr__title">Behavior Risk Heatmap (Weekday x Hour)</div>
+          <div className="heatmapHdr__axis muted">
+            Y-axis: weekday (Mon-Sun) | X-axis: market hour bucket (09-17, local time)
           </div>
+          <div className="muted">Risk incidents are based on detected flagged trades.</div>
         </div>
-        <AntSegmented
-          className="heatmapModeTabs"
-          value={mode}
-          onChange={(next) => setMode(next as HeatmapMode)}
-          disabled={!hasAnyHeatmapData}
-          options={[
-            { label: "Risk", value: "bias" },
-            { label: "PnL", value: "pnl" },
-          ]}
-        />
       </div>
 
-      {!hasAnyHeatmapData ? (
+      {!hasBiasHeatmapData ? (
         <div className="heatmapEmpty">
           <div className="heatmapEmpty__title">No Heatmap Data Yet</div>
-          <div className="muted">Upload a trade CSV, then run analysis to populate danger hours and PnL maps.</div>
+          <div className="muted">Upload a trade CSV, then run analysis to populate weekday-hour danger data.</div>
         </div>
-      ) : mode === "bias" ? (
-        !hasBiasHeatmapData ? (
-          <div className="heatmapEmpty heatmapEmpty--compact">
-            <div className="heatmapEmpty__title">Danger Hours Unavailable</div>
-            <div className="muted">This analysis did not return weekday-hour danger data.</div>
-          </div>
-        ) : (
+      ) : (
         <div className="dangerTableWrap">
           <AntTable
             className="dangerTable"
@@ -1966,65 +1966,6 @@ function DangerHeatmap({
             scroll={{ x: "max-content" }}
           />
         </div>
-        )
-      ) : (
-        !hasPnlHeatmapData ? (
-          <div className="heatmapEmpty heatmapEmpty--compact">
-            <div className="heatmapEmpty__title">PnL Calendar Unavailable</div>
-            <div className="muted">This analysis did not return daily PnL points.</div>
-          </div>
-        ) : (
-        <div className="pnlHeatmapWrap">
-          <div className="pnlHeatmapWeekdays">
-            {DANGER_DAYS.map((day) => (
-              <span key={day} className="pnlHeatmapWeekdays__day mono">
-                {day}
-              </span>
-            ))}
-          </div>
-
-          <div className="pnlHeatmapGrid">
-            {pnlCalendar.map((entry, index) => {
-              if (!entry) return <div key={`empty-${index}`} className="pnlCell pnlCell--empty" aria-hidden="true" />;
-
-              const dayLabel = new Intl.DateTimeFormat("en-US", {
-                weekday: "short",
-                month: "short",
-                day: "numeric",
-                year: "numeric",
-              }).format(entry.date);
-
-              return (
-                <AntTooltip
-                  key={entry.key}
-                  overlayClassName="pnlCellTooltip"
-                  title={
-                    <div className="pnlCellTooltip__content">
-                      <span className="muted">{dayLabel}:</span>{" "}
-                      <span className={cn("mono", "pnlCellTooltip__value", entry.pnl >= 0 ? "pnlCellTooltip__value--pos" : "pnlCellTooltip__value--neg")}>
-                        {formatPnlCurrency(entry.pnl)}
-                      </span>
-                    </div>
-                  }
-                >
-                  <div className={cn("pnlCell", resolvePnlToneClass(entry.pnl))}>
-                    <span className="pnlCell__day mono">{entry.dayOfMonth}</span>
-                  </div>
-                </AntTooltip>
-              );
-            })}
-          </div>
-
-          <div className="pnlHeatmapLegend muted">
-            <span className="legend__dot pnlLegend__dot--neg" />
-            Loss days
-            <span className="legend__dot pnlLegend__dot--flat" />
-            Flat
-            <span className="legend__dot pnlLegend__dot--pos" />
-            Profit days
-          </div>
-        </div>
-        )
       )}
     </div>
   );
@@ -2061,10 +2002,22 @@ function CommandWorkspace({
     return () => window.cancelAnimationFrame(raf);
   }, [riskScore]);
 
+  useEffect(() => {
+    const nextGranularity = detectDefaultChartGranularity(
+      analysis?.trade_timeline,
+      analysis?.flagged_trades,
+      analysis?.daily_pnl
+    );
+    setChartGranularity(nextGranularity);
+  }, [analysis?.trade_timeline, analysis?.flagged_trades, analysis?.daily_pnl]);
+
   const radius = 15.915;
   const circumference = 2 * Math.PI * radius;
   const stroke = `${(animatedRiskScore / 100) * circumference} ${circumference}`;
-  const commandSnapshotCards = buildCommandSnapshotCards(analysis, chartGranularity);
+  const commandSnapshotCards = useMemo(
+    () => buildCommandSnapshotCards(analysis, chartGranularity),
+    [analysis, chartGranularity]
+  );
 
   return (
     <div className="canvas">
@@ -2080,16 +2033,21 @@ function CommandWorkspace({
           </div>
 
           <div className="stack">
-            {commandSnapshotCards.map((card) => (
-              <BarChartCard
-                key={card.id}
-                title={card.title}
-                value={card.value}
-                valueTone={card.valueTone}
-                bars={card.bars}
-                size="compact"
-              />
-            ))}
+            {commandSnapshotCards.map((card) =>
+              card.id === "realized_pnl" ? (
+                <PnlChartCard key={card.id} card={card} analysis={analysis} />
+              ) : (
+                <BarChartCard
+                  key={card.id}
+                  title={card.title}
+                  value={card.value}
+                  valueTone={card.valueTone}
+                  bars={card.bars}
+                  legend={card.legend}
+                  size="compact"
+                />
+              )
+            )}
           </div>
         </Card>
 
@@ -2137,11 +2095,9 @@ function CommandWorkspace({
           </Card>
 
           <div className="commandPane__bottom">
-            <Card title="Danger Heatmaps" className="dangerFocusCard">
+            <Card title="Danger Heatmaps">
               <DangerHeatmap
                 dangerHours={analysis?.danger_hours}
-                dailyPnl={analysis?.daily_pnl}
-                tradeTimeline={analysis?.trade_timeline}
                 biasScores={analysis?.bias_scores}
                 topTriggers={analysis?.top_triggers}
                 flaggedTrades={analysis?.flagged_trades}
@@ -2154,13 +2110,13 @@ function CommandWorkspace({
                 <div className="miniRow">
                   <span>PnL</span>
                   <span className={`mono ${(analysis?.summary?.total_pnl || 0) >= 0 ? 'pos' : 'neg'}`}>
-                    {(analysis?.summary?.total_pnl || 0) >= 0 ? '+' : ''}{analysis?.summary?.total_pnl || 0}
+                    {(analysis?.summary?.total_pnl || 0) >= 0 ? '+' : ''}{(analysis?.summary?.total_pnl || 0).toFixed(2)}
                   </span>
                 </div>
                 <div className="miniRow">
                   <span>Drawdown</span>
                   <span className="mono neg">
-                    -{analysis?.summary?.max_drawdown || 0}
+                    -{(analysis?.summary?.max_drawdown || 0).toFixed(2)}
                   </span>
                 </div>
                 <div className="miniRow">
@@ -2195,114 +2151,135 @@ function TradesWorkspace({
   flaggedTradesRaw?: FlaggedTrade[];
   biasScores?: Record<string, number>;
 }) {
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
-  const columns = [
-    {
-      title: "Time",
-      dataIndex: "time",
-      key: "time",
-      render: (value: string) => <span className="mono">{value}</span>,
-    },
-    {
-      title: "Symbol",
-      dataIndex: "symbol",
-      key: "symbol",
-      render: (value: string) => <span className="mono">{value}</span>,
-    },
-    { title: "Side", dataIndex: "side", key: "side" },
-    {
-      title: "Size",
-      dataIndex: "size",
-      key: "size",
-      render: (value: number) => <span className="mono">{value.toFixed(2)}</span>,
-    },
-    {
-      title: "Dur",
-      dataIndex: "durationMin",
-      key: "durationMin",
-      render: (value: number) => <span className="mono">{value}m</span>,
-    },
-    {
-      title: "PnL",
-      dataIndex: "pnl",
-      key: "pnl",
-      render: (value: number) => <span className={cn("mono", value >= 0 ? "pos" : "neg")}>{value >= 0 ? `+${value}` : value}</span>,
-    },
-    {
-      title: "Prominent Flag",
-      dataIndex: "flags",
-      key: "flags",
-      render: (flags: BiasType[]) => (
-        <div className="chipsRow">
-          {flags.length ? (
-            flags.map((flag) => (
-              <Pill key={flag} tone="warn">
-                {flag}
-              </Pill>
-            ))
-          ) : (
-            <Pill tone="ok">Clean</Pill>
-          )}
-        </div>
-      ),
-    },
-    {
-      title: "Bias Conf",
-      dataIndex: "confidence",
-      key: "confidence",
-      render: (value: number) => <span className="mono">{value ? `${value}%` : "-"}</span>,
-    },
-  ];
+  const [sortKey, setSortKey] = useState<"time" | "pnl" | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+
+  const sorted = useMemo(() => {
+    if (!sortKey) return trades;
+    return [...trades].sort((a, b) => {
+      const mul = sortDir === "asc" ? 1 : -1;
+      if (sortKey === "pnl") return (a.pnl - b.pnl) * mul;
+      return a.time.localeCompare(b.time) * mul;
+    });
+  }, [trades, sortKey, sortDir]);
+
+  const flaggedTradeById = useMemo(() => {
+    const byId = new Map<string, FlaggedTrade>();
+    for (const trade of flaggedTradesRaw ?? []) {
+      if (!trade.trade_id) continue;
+      byId.set(trade.trade_id, trade);
+    }
+    return byId;
+  }, [flaggedTradesRaw]);
+
+  const toggleSort = (key: "time" | "pnl") => {
+    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(key); setSortDir("asc"); }
+  };
+
+  const parentRef = useRef<HTMLDivElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: sorted.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 42,
+    overscan: 10,
+  });
+
+  const cols = [
+    { key: "time",       label: "Date",          sortable: true,  align: "left"   },
+    { key: "symbol",     label: "Symbol",         sortable: false, align: "left"   },
+    { key: "side",       label: "Side",           sortable: false, align: "left"   },
+    { key: "size",       label: "Quantity",       sortable: false, align: "center" },
+    { key: "pnl",        label: "Profit / Loss",  sortable: true,  align: "center" },
+    { key: "balance",    label: "Balance",        sortable: false, align: "center" },
+    { key: "flags",      label: "Bias Flag",      sortable: false, align: "left"   },
+    { key: "confidence", label: "Confidence",     sortable: false, align: "center" },
+  ] as const;
+
+  const renderCell = (trade: Trade, key: string) => {
+    switch (key) {
+      case "time":       return <span className="mono">{trade.time}</span>;
+      case "symbol":     return <span className="mono">{trade.symbol}</span>;
+      case "side":       return <span>{trade.side}</span>;
+      case "size":       return <span className="mono">{trade.size.toFixed(2)}</span>;
+      case "pnl":        return <span className={cn("mono", trade.pnl >= 0 ? "pos" : "neg")}>{trade.pnl >= 0 ? `+${trade.pnl.toFixed(2)}` : trade.pnl.toFixed(2)}</span>;
+      case "balance":    return trade.balance != null ? <span className="mono">${trade.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span> : <span className="muted">N/A</span>;
+      case "flags":      return <div className="chipsRow">{trade.flags.length ? trade.flags.map(f => <Pill key={f} tone="warn">{f}</Pill>) : <Pill tone="ok">Clean</Pill>}</div>;
+      case "confidence": return <span className="mono">{trade.confidence ? `${trade.confidence}%` : "N/A"}</span>;
+      default:           return null;
+    }
+  };
 
   return (
     <div className="canvas">
       <div className="grid">
         <Card title="Flagged Trades" className="span-7">
-          <div className="tableWrap">
-            <AntTable<Trade>
-              className="table"
-              size="small"
-              columns={columns}
-              dataSource={trades}
-              rowKey="id"
-              pagination={false}
-              rowClassName={(record) => cn("tr", selected?.id === record.id && "tr--active")}
-              onRow={(record) => {
-                const isHovered = hoveredId === record.id;
-                const isSelected = selected?.id === record.id;
-                let backgroundColor = "transparent";
-                let boxShadow = "none";
-                
-                if (isSelected && isHovered) {
-                  backgroundColor = "rgba(47,232,199,.65)";
-                  boxShadow = "inset 0 0 50px rgba(47,232,199,.8), 0 0 150px rgba(47,232,199,.6), 0 0 300px rgba(47,232,199,.4), 0 0 450px rgba(47,232,199,.2)";
-                } else if (isSelected) {
-                  backgroundColor = "rgba(47,232,199,.5)";
-                  boxShadow = "inset 0 0 40px rgba(47,232,199,.7), 0 0 120px rgba(47,232,199,.5), 0 0 240px rgba(47,232,199,.3), 0 0 360px rgba(47,232,199,.15)";
-                } else if (isHovered) {
-                  backgroundColor = "rgba(47,232,199,.35)";
-                  boxShadow = "0 0 90px rgba(47,232,199,.4), 0 0 180px rgba(47,232,199,.25), 0 0 300px rgba(47,232,199,.12)";
-                }
-                
-                return {
-                  onClick: () => onSelect(record),
-                  onMouseEnter: () => setHoveredId(record.id),
-                  onMouseLeave: () => setHoveredId(null),
-                  style: { 
-                    backgroundColor,
-                    boxShadow,
-                    cursor: "pointer",
-                  },
-                };
-              }}
-            />
+          <div className="vTableWrap">
+            {/* Sticky header */}
+            <div className="vTable__head">
+              {cols.map((col) => (
+                <div
+                  key={col.key}
+                  className={cn("vTable__th", col.sortable && "vTable__th--sort", col.align === "center" && "vTable__th--center")}
+                  onClick={col.sortable ? () => toggleSort(col.key as "time" | "pnl") : undefined}
+                >
+                  {col.label}
+                  {col.sortable && (
+                    <span className="vTable__sorter">
+                      <span className={cn("vTable__arrow", sortKey === col.key && sortDir === "asc" && "vTable__arrow--active")}>^</span>
+                      <span className={cn("vTable__arrow", sortKey === col.key && sortDir === "desc" && "vTable__arrow--active")}>v</span>
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Scrollable virtual body */}
+            <div ref={parentRef} className="vTable__body">
+              <div style={{ height: rowVirtualizer.getTotalSize(), position: "relative" }}>
+                {rowVirtualizer.getVirtualItems().map((vRow) => {
+                  const trade = sorted[vRow.index];
+                  const isSelected = selected?.id === trade.id;
+                  return (
+                    <div
+                      key={trade.id}
+                      data-index={vRow.index}
+                      ref={rowVirtualizer.measureElement}
+                      className={cn("vTable__row", isSelected && "vTable__row--active")}
+                      style={{ position: "absolute", top: vRow.start, left: 0, right: 0 }}
+                      onClick={() => onSelect(trade)}
+                      onMouseEnter={(e) => {
+                        const el = e.currentTarget as HTMLElement;
+                        el.style.transform = "scaleY(1.09) scaleX(1.005)";
+                        el.style.boxShadow = "0 0 0 1px rgba(200,220,255,.12), 0 8px 28px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.07), inset 0 -1px 0 rgba(255,255,255,.03)";
+                        el.style.background = "rgba(18,26,40,.92)";
+                        el.style.zIndex = "3";
+                      }}
+                      onMouseLeave={(e) => {
+                        const el = e.currentTarget as HTMLElement;
+                        el.style.transform = "";
+                        el.style.boxShadow = "";
+                        el.style.background = "";
+                        el.style.zIndex = "";
+                      }}
+                    >
+                      {cols.map((col) => (
+                        <div key={col.key} className={cn("vTable__td", col.align === "center" && "vTable__td--center")}>
+                          {renderCell(trade, col.key)}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </Card>
 
         <Card title="Trade Inspector" className="span-5">
           {selected && flaggedTradesRaw ? (
             (() => {
-              const flaggedTrade = flaggedTradesRaw.find((ft) => ft.trade_id === selected.id);
+              const flaggedTrade = flaggedTradeById.get(selected.id);
               if (!flaggedTrade) return <div className="muted">Trade details not found.</div>;
               
               const biasDisplayNames: Record<BiasKey, string> = {
@@ -2338,7 +2315,7 @@ function TradesWorkspace({
                             </div>
                             <div className="muted" style={{ fontSize: "11px", marginTop: "4px", fontStyle: "italic", color: "rgba(232,240,255,.7)" }}>
                               {flaggedTrade.evidence && flaggedTrade.evidence.length > 0
-                                ? flaggedTrade.evidence.join(" • ")
+                                ? flaggedTrade.evidence.join(" | ")
                                 : "No specific evidence recorded"}
                             </div>
                           </div>
@@ -2360,59 +2337,12 @@ function TradesWorkspace({
   );
 }
 
-function HeatmapWorkspace({
-  dangerHours,
-  dailyPnl,
-  tradeTimeline,
-  biasScores,
-  topTriggers,
-  flaggedTrades,
-  explainability,
-}: {
-  dangerHours?: number[][];
-  dailyPnl?: AnalysisOutput["daily_pnl"];
-  tradeTimeline?: AnalysisOutput["trade_timeline"];
-  biasScores?: AnalysisOutput["bias_scores"];
-  topTriggers?: string[];
-  flaggedTrades?: AnalysisOutput["flagged_trades"];
-  explainability?: AnalysisOutput["explainability"];
-}) {
-  const [chartGranularity, setChartGranularity] = useState<ChartGranularity>("15m");
-
-  return (
-    <div className="canvas">
-      <div className="grid dangerFocusGrid">
-        <Card title="Danger Heatmaps" className="span-8 tall dangerFocusCard">
-          <DangerHeatmap
-            dangerHours={dangerHours}
-            dailyPnl={dailyPnl}
-            tradeTimeline={tradeTimeline}
-            biasScores={biasScores}
-            topTriggers={topTriggers}
-            flaggedTrades={flaggedTrades}
-            explainability={explainability}
-          />
-        </Card>
-
-        <Card title="Session Charts" className="span-4 tall dangerCarouselCard dangerFocusCard">
-          <SnapshotChartsCarousel
-            analysis={{ trade_timeline: tradeTimeline, flagged_trades: flaggedTrades }}
-            granularity={chartGranularity}
-            onGranularityChange={(next) => setChartGranularity(next)}
-            size="large"
-          />
-        </Card>
-      </div>
-    </div>
-  );
-}
-
 function SimulatorWorkspace({
   analysisData,
-  importedCsvData,
+  datasetId,
 }: {
   analysisData: AnalysisOutput | null;
-  importedCsvData: any[];
+  datasetId: string | null;
 }) {
   const [cooldownMinutes, setCooldownMinutes] = useState(15);
   const [dailyTradeCap, setDailyTradeCap] = useState(10);
@@ -2421,8 +2351,8 @@ function SimulatorWorkspace({
   const [simulationResult, setSimulationResult] = useState<any>(null);
   const [isRunning, setIsRunning] = useState(false);
 
-  // Calculate max values based on imported data
-  const totalTrades = importedCsvData?.length || 0;
+  // Calculate max values from backend analysis summary
+  const totalTrades = analysisData?.summary?.total_trades ?? 0;
   const maxDailyTradesCap = Math.max(50, totalTrades);
   const maxLossesStreak = Math.max(10, totalTrades);
 
@@ -2439,27 +2369,15 @@ function SimulatorWorkspace({
   }, [totalTrades]);
 
   const runSimulation = async () => {
-    if (!importedCsvData || importedCsvData.length === 0) {
+    if (!datasetId) {
       antMessage.warning("No trade data available. Please import a CSV first.");
       return;
     }
 
     setIsRunning(true);
     try {
-      // Convert imported CSV to trade format
-      const trades = importedCsvData.map((row: any) => ({
-        timestamp: new Date(row.timestamp || row.date).toISOString(),
-        asset: row.symbol || row.asset,
-        side: row.side.toUpperCase() === "BUY" ? "BUY" : "SELL",
-        quantity: parseFloat(row.size || row.quantity),
-        entry_price: parseFloat(row.entry_price),
-        exit_price: parseFloat(row.exit_price),
-        profit_loss: parseFloat(row.pnl || row.profit_loss),
-        balance: parseFloat(row.balance) || 0,
-      }));
-
       const result = await simulateDataset({
-        trades,
+        dataset_id: datasetId,
         rules: {
           cooldown_after_loss_minutes: cooldownMinutes,
           daily_trade_cap: dailyTradeCap,
@@ -2645,7 +2563,7 @@ function SimulatorWorkspace({
 
         {simulationResult && simulationResult.blocked_trades.length > 0 && (
           <Card title="Affected Trades" className="span-full">
-            <div style={{ maxHeight: "300px", overflow: "auto" }}>
+            <div className="simTableWrap" style={{ maxHeight: "300px", overflow: "auto" }}>
               <table className="simTable">
                 <thead>
                   <tr>
@@ -2845,7 +2763,7 @@ function PracticeWorkspace({ datasetId, scoringMode, analysis }: PracticeWorkspa
     return (
       <div className="canvas">
         <div className="grid">
-          <Card title="Practice Complete! 🎉" className="span-full">
+          <Card title="Practice Complete" className="span-full">
             <div style={{ padding: "20px" }}>
               <div style={{ textAlign: "center", marginBottom: "40px" }}>
                 <div style={{ fontSize: "72px", fontWeight: "bold", color: "#51cf66", marginBottom: "15px" }}>
@@ -2903,13 +2821,13 @@ function PracticeWorkspace({ datasetId, scoringMode, analysis }: PracticeWorkspa
                     justifyContent: "center",
                   }}
                 >
-                  <div style={{ fontSize: "16px", fontWeight: "bold", marginBottom: "15px", color: "#51cf66" }}>🎯 Your Next Habit</div>
+                  <div style={{ fontSize: "16px", fontWeight: "bold", marginBottom: "15px", color: "#51cf66" }}>Your Next Habit</div>
                   <div style={{ fontSize: "15px", lineHeight: "1.8", color: "#ddd" }}>
                     {habitSuggestion}
                   </div>
                 </div>
               </div>
-              <div style={{ fontSize: "16px", fontWeight: "bold", marginBottom: "15px", color: "#51cf66" }}>🎯 Your Next Habit</div>
+              <div style={{ fontSize: "16px", fontWeight: "bold", marginBottom: "15px", color: "#51cf66" }}>Your Next Habit</div>
               <div style={{ fontSize: "15px", lineHeight: "1.8", color: "#ddd" }}>{habitSuggestion}</div>
             </div>
 
@@ -3034,10 +2952,10 @@ function PracticeWorkspace({ datasetId, scoringMode, analysis }: PracticeWorkspa
                   <span style={{ marginRight: "12px", fontWeight: "bold" }}>{String.fromCharCode(65 + idx)})</span>
                   {choice}
                   {isCurrentAnswered && idx === currentQuestion.correct_index && (
-                    <span style={{ marginLeft: "auto", color: "#51cf66" }}>✓ Correct</span>
+                    <span style={{ marginLeft: "auto", color: "#51cf66" }}>Correct</span>
                   )}
                   {isCurrentAnswered && idx === userSelectedIndex && !isCorrect && (
-                    <span style={{ marginLeft: "auto", color: "#ff6b6b" }}>✗ Not quite</span>
+                    <span style={{ marginLeft: "auto", color: "#ff6b6b" }}>Not quite</span>
                   )}
                 </button>
               ))}
@@ -3055,7 +2973,7 @@ function PracticeWorkspace({ datasetId, scoringMode, analysis }: PracticeWorkspa
               }}
             >
               <div style={{ fontWeight: "bold", marginBottom: "8px", color: isCorrect ? "#51cf66" : "#ff8787" }}>
-                {isCorrect ? "Excellent! 🎯" : "Let's learn from this 📚"}
+                {isCorrect ? "Excellent!" : "Let's learn from this."}
               </div>
               <div style={{ fontSize: "14px", lineHeight: "1.6", color: "#ddd" }}>{currentQuestion.explanation}</div>
             </div>
@@ -3078,206 +2996,315 @@ function PracticeWorkspace({ datasetId, scoringMode, analysis }: PracticeWorkspa
   );
 }
 
-function PulseWorkspace({ datasetId }: { datasetId: string | null }) {
-  const [explainerData, setExplainerData] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
-  const [personalReasons, setPersonalReasons] = useState<{ [key: string]: string }>({});
+function PulseWorkspace({
+  datasetId,
+  analysis,
+}: {
+  datasetId: string | null;
+  analysis: AnalysisOutput | null;
+}) {
+  const topBiases = useMemo(() => getTopTwoBiasesFromScores(analysis?.bias_scores), [analysis]);
+  const [answersByBias, setAnswersByBias] = useState<Record<CanonicalBiasType, EmotionalCheckInAnswer[]>>(
+    createEmptyCheckinAnswerMap
+  );
+  const [explainerData, setExplainerData] = useState<BiasContextExplainerResponse | null>(null);
+  const [loadingContext, setLoadingContext] = useState(false);
 
-  const loadContextExplainer = async () => {
+  const hydrateAnswersFromStorage = useCallback(() => {
     if (!datasetId) {
-      antMessage.warning("Please import a dataset first.");
+      setAnswersByBias(createEmptyCheckinAnswerMap());
       return;
     }
 
-    setLoading(true);
+    const nextAnswers = createEmptyCheckinAnswerMap();
+    topBiases.forEach((bias) => {
+      nextAnswers[bias.biasType] = readStoredBiasAnswers(datasetId, bias.biasType);
+    });
+
+    setAnswersByBias(nextAnswers);
+  }, [datasetId, topBiases]);
+
+  useEffect(() => {
+    if (!datasetId) {
+      setExplainerData(null);
+      setAnswersByBias(createEmptyCheckinAnswerMap());
+      return;
+    }
+
+    hydrateAnswersFromStorage();
+    setExplainerData(null);
+  }, [datasetId, hydrateAnswersFromStorage]);
+
+  const updateAnswer = (biasType: CanonicalBiasType, questionIndex: number, answer: EmotionalCheckInAnswer) => {
+    if (!datasetId) return;
+
+    setAnswersByBias((previous) => {
+      const current = previous[biasType] ?? [null, null, null];
+      const updatedAnswers: EmotionalCheckInAnswer[] = [current[0] ?? null, current[1] ?? null, current[2] ?? null];
+      updatedAnswers[questionIndex] = answer;
+      writeStoredBiasAnswers(datasetId, biasType, updatedAnswers);
+      return {
+        ...previous,
+        [biasType]: updatedAnswers,
+      };
+    });
+  };
+
+  const generatePersonalizedContext = async (): Promise<boolean> => {
+    if (!datasetId) {
+      antMessage.warning("Please import a dataset first.");
+      return false;
+    }
+
+    if (topBiases.length === 0) {
+      antMessage.warning("No top biases available. Import a dataset and run analysis first.");
+      return false;
+    }
+
+    const emotionalPayload: EmotionalCheckInBiasPayload[] = topBiases.map((bias) => ({
+      bias_type: bias.biasType,
+      score: bias.score,
+      responses: EMOTIONAL_CHECKIN_QUESTIONS[bias.biasType].map((question, idx) => ({
+        question_id: `${bias.biasType}_Q${idx + 1}`,
+        question,
+        answer: answersByBias[bias.biasType]?.[idx] ?? null,
+      })),
+    }));
+
+    setLoadingContext(true);
     try {
-      // First, get the analysis results to get date range and top biases
-      const analysis = await analyzeDataset({
-        dataset_id: datasetId,
-        scoring_mode: "hybrid",
-      });
-
-      // Get top 2 biases from bias_scores object
-      const biasEntries = Object.entries(analysis.bias_scores || {})
-        .map(([biasType, score]: [string, any]) => ({
-          bias_type: biasType,
-          score: typeof score === 'number' ? score : 0,
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 2);
-
-      if (biasEntries.length === 0) {
-        antMessage.warning("No biases detected in this dataset.");
-        setLoading(false);
-        return;
-      }
-
-      // Call context explainer endpoint using proper API function
       const data = await getBiasContextExplainer({
         dataset_id: datasetId,
-        top_two_biases: biasEntries,
+        session_id: datasetId,
+        top_two_biases: topBiases.map((bias) => ({
+          bias_type: bias.biasType,
+          score: bias.score,
+        })),
+        emotional_check_in: emotionalPayload,
       });
 
       setExplainerData(data);
-
-      // Initialize personal reasons
-      const reasons: { [key: string]: string } = {};
-      biasEntries.forEach((bias: any) => {
-        reasons[bias.bias_type] = "";
-      });
-      setPersonalReasons(reasons);
-    } catch (error) {
-      console.error("Error loading context explainer:", error);
-      antMessage.error("Failed to load context explanation. Check console.");
+      antMessage.success("Personalized bias context generated.");
+      return true;
+    } catch (error: unknown) {
+      antMessage.error(getErrorMessage(error, "Failed to generate personalized context."));
+      return false;
     } finally {
-      setLoading(false);
+      setLoadingContext(false);
     }
   };
 
   return (
     <div className="canvas">
       <div className="grid">
-        {/* Header with dataset selector and load button */}
-        <div className="span-12" style={{ display: "flex", gap: "12px", alignItems: "center", padding: "12px", backgroundColor: "var(--panel)", borderRadius: "var(--radius)", border: "1px solid var(--stroke)" }}>
+        <div
+          className="span-12"
+          style={{
+            display: "flex",
+            gap: "12px",
+            alignItems: "center",
+            padding: "12px",
+            backgroundColor: "var(--panel)",
+            borderRadius: "var(--radius)",
+            border: "1px solid var(--stroke)",
+          }}
+        >
           <div style={{ flex: 1, color: "var(--muted)" }}>
-            {datasetId ? `Dataset: ${datasetId}` : "No dataset imported. Please import CSV first."}
+            {datasetId ? `Session: ${datasetId}` : "No dataset imported. Please import CSV first."}
           </div>
           <Button
-            variant="primary"
-            onClick={loadContextExplainer}
-            disabled={loading || !datasetId}
+            variant="ghost"
+            onClick={hydrateAnswersFromStorage}
+            disabled={!datasetId || topBiases.length === 0}
           >
-            {loading ? "Loading..." : "Load Context Explainer"}
+            Reload Saved Answers
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => {
+              void generatePersonalizedContext();
+            }}
+            disabled={!datasetId || loadingContext || topBiases.length === 0}
+          >
+            {loadingContext ? "Generating..." : "Generate Personalized Context"}
           </Button>
         </div>
 
-        {/* Context Explainer Output */}
-        {explainerData && (
+        {analysis && topBiases.length > 0 ? (
+          <div className="span-12" style={{ display: "grid", gap: "12px", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
+            {topBiases.map((bias) => (
+              <div
+                key={bias.biasType}
+                style={{
+                  padding: "12px",
+                  backgroundColor: "var(--panel)",
+                  borderRadius: "var(--radius)",
+                  border: "1px solid var(--stroke)",
+                }}
+              >
+                <div style={{ fontSize: "14px", fontWeight: 600 }}>{CANONICAL_BIAS_LABELS[bias.biasType]}</div>
+                <div style={{ fontSize: "12px", color: "var(--muted)", marginTop: "4px" }}>Score: {bias.score}/100</div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {datasetId && topBiases.length === 0 ? (
+          <div
+            className="span-12"
+            style={{
+              padding: "12px",
+              backgroundColor: "var(--panel)",
+              borderRadius: "var(--radius)",
+              border: "1px solid var(--stroke)",
+              color: "var(--muted)",
+            }}
+          >
+            No bias scores are available for this session yet.
+          </div>
+        ) : null}
+
+        {explainerData ? (
           <>
-            {/* Bias Explanations */}
-            {explainerData.bias_contexts?.map((context: any, idx: number) => (
-              <div key={idx} className="span-6 tall" style={{ padding: "12px", backgroundColor: "var(--panel)", borderRadius: "var(--radius)", border: "1px solid var(--stroke)" }}>
-                <div className="section">
-                  <div className="section__title" style={{ fontSize: "16px", fontWeight: "600" }}>
-                    {context.bias_name}
-                  </div>
-                  <div className="muted" style={{ fontSize: "12px", marginBottom: "12px" }}>
-                    Why this bias spiked during your trading period
-                  </div>
+            <div
+              className="span-12"
+              style={{
+                padding: "12px",
+                backgroundColor: "var(--panel)",
+                borderRadius: "var(--radius)",
+                border: "1px solid var(--stroke)",
+              }}
+            >
+              <div className="section__title" style={{ marginBottom: "6px" }}>Real-World Bias Context</div>
+              <div style={{ fontSize: "12px", color: "var(--muted)" }}>
+                Recent market context is shown first. Personalized emotional context appears below.
+              </div>
+            </div>
+            {explainerData.bias_contexts.map((context) => (
+              <div
+                key={`context-${context.bias_type}`}
+                className="span-6"
+                style={{
+                  padding: "12px",
+                  backgroundColor: "var(--panel)",
+                  borderRadius: "var(--radius)",
+                  border: "1px solid var(--stroke)",
+                }}
+              >
+                <div className="section__title" style={{ fontSize: "16px" }}>{context.bias_name}</div>
+                <div style={{ fontSize: "12px", color: "var(--muted)", marginBottom: "8px" }}>
+                  Recent market and economic context (educational).
+                </div>
 
-                  {/* Market Events */}
-                  <div style={{ marginBottom: "16px" }}>
-                    <div style={{ fontSize: "12px", fontWeight: "600", marginBottom: "8px" }}>
-                      📰 Relevant Market Events
+                <div style={{ marginBottom: "12px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: 600, marginBottom: "6px" }}>Context Signals</div>
+                  {context.market_events.map((event, eventIdx) => (
+                    <div key={`${context.bias_type}-event-${eventIdx}`} style={{ fontSize: "12px", marginBottom: "6px" }}>
+                      <span style={{ color: "var(--muted)", marginRight: "6px" }}>{event.date}</span>
+                      <span>{event.headline}</span>
                     </div>
-                    {context.market_events?.map((event: any, i: number) => (
-                      <div
-                        key={i}
-                        style={{
-                          fontSize: "12px",
-                          marginBottom: "8px",
-                          paddingLeft: "8px",
-                          borderLeft: "2px solid var(--stroke)",
-                        }}
-                      >
-                        <div style={{ fontWeight: "500", color: "var(--muted)" }}>{event.date}</div>
-                        <div>{event.headline}</div>
-                      </div>
-                    ))}
-                  </div>
+                  ))}
+                </div>
 
-                  {/* Connection to Bias */}
-                  <div style={{ marginBottom: "16px" }}>
-                    <div style={{ fontSize: "12px", fontWeight: "600", marginBottom: "8px" }}>
-                      🔗 How This Connected to Your Trading
-                    </div>
-                    <div style={{ fontSize: "13px", lineHeight: "1.5" }}>
-                      {context.connection_explanation}
-                    </div>
-                  </div>
+                <div style={{ marginBottom: "10px", fontSize: "13px", lineHeight: 1.5 }}>
+                  {context.connection_explanation}
+                </div>
 
-                  {/* Practical Takeaway */}
-                  <div style={{ marginBottom: "16px" }}>
-                    <div style={{ fontSize: "12px", fontWeight: "600", marginBottom: "8px" }}>
-                      ✓ Practical Takeaway for Next Time
-                    </div>
-                    <div
-                      style={{
-                        fontSize: "13px",
-                        lineHeight: "1.5",
-                        padding: "8px",
-                        backgroundColor: "var(--surfaceA)",
-                        borderRadius: "4px",
-                      }}
-                    >
-                      {context.practical_takeaway}
-                    </div>
-                  </div>
-
-                  {/* Personal Reasons Section */}
-                  <div>
-                    <div style={{ fontSize: "12px", fontWeight: "600", marginBottom: "8px" }}>
-                      💭 Personal Reasons (Fill In Your Own)
-                    </div>
-                    <div style={{ fontSize: "12px", color: "var(--muted2)", marginBottom: "6px" }}>
-                      What personal factors may have contributed? (e.g., stress, fatigue, FOMO,
-                      boredom, time pressure)
-                    </div>
-                    <AntTextArea
-                      rows={3}
-                      value={personalReasons[context.bias_name] || ""}
-                      onChange={(e) =>
-                        setPersonalReasons({
-                          ...personalReasons,
-                          [context.bias_name]: e.target.value,
-                        })
-                      }
-                      placeholder="Write your personal factors here..."
-                    />
-                  </div>
+                <div
+                  style={{
+                    fontSize: "13px",
+                    lineHeight: 1.5,
+                    padding: "8px",
+                    backgroundColor: "var(--surfaceA)",
+                    borderRadius: "6px",
+                  }}
+                >
+                  {context.practical_takeaway}
                 </div>
               </div>
             ))}
 
-            {/* Evidence Summary */}
-            {explainerData.date_range && (
-              <div className="span-12" style={{ padding: "12px", backgroundColor: "var(--panel)", borderRadius: "var(--radius)", border: "1px solid var(--stroke)" }}>
-                <div>
-                  <div className="section__title" style={{ fontSize: "14px", marginBottom: "8px" }}>
-                    📊 Analysis Period & Methodology
-                  </div>
-                  <div style={{ fontSize: "12px", color: "var(--muted)", lineHeight: "1.6" }}>
-                    <div>
-                      <strong>Trading Period:</strong> {explainerData.date_range.start} to{" "}
-                      {explainerData.date_range.end}
+            <div
+              className="span-12"
+              style={{
+                padding: "12px",
+                backgroundColor: "var(--panel)",
+                borderRadius: "var(--radius)",
+                border: "1px solid var(--stroke)",
+              }}
+            >
+              <div className="section__title" style={{ marginBottom: "10px" }}>Personalized Bias Context</div>
+              <div style={{ display: "grid", gap: "12px", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+                {explainerData.personalized_sections.map((section) => (
+                  <div
+                    key={`personalized-${section.bias_type}`}
+                    style={{
+                      padding: "12px",
+                      border: "1px solid var(--stroke)",
+                      borderRadius: "8px",
+                      backgroundColor: "var(--surfaceA)",
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, marginBottom: "6px" }}>{section.bias_name}</div>
+                    <div style={{ fontSize: "12px", color: "var(--muted)", marginBottom: "10px" }}>{section.headline}</div>
+                    <div style={{ fontSize: "13px", lineHeight: 1.5, marginBottom: "10px" }}>{section.supportive_explanation}</div>
+                    <div style={{ fontSize: "12px", marginBottom: "8px" }}>
+                      Yes: {section.checkin_summary.yes_count} | No: {section.checkin_summary.no_count} | Skip: {section.checkin_summary.skipped_count}
                     </div>
-                    <div>
-                      <strong>Approach:</strong> This analysis uses publicly available market events
-                      and economic data to explain potential factors behind detected bias patterns.
-                      These are correlations and contextual connections, not causation. Your personal
-                      factors, decisions, and emotions remain the primary drivers of your trading.
-                    </div>
+                    <div style={{ fontSize: "12px", fontWeight: 600, marginBottom: "6px" }}>Possible contributors</div>
+                    <ul style={{ marginTop: 0, marginBottom: "10px", paddingLeft: "18px", fontSize: "12px", lineHeight: 1.5 }}>
+                      {section.hypothetical_contributors.map((item, idx) => (
+                        <li key={`${section.bias_type}-contributor-${idx}`}>{item}</li>
+                      ))}
+                    </ul>
+                    <div style={{ fontSize: "12px", fontWeight: 600, marginBottom: "6px" }}>Gentle process habits</div>
+                    <ul style={{ marginTop: 0, marginBottom: "10px", paddingLeft: "18px", fontSize: "12px", lineHeight: 1.5 }}>
+                      {section.gentle_process_habits.map((habit, idx) => (
+                        <li key={`${section.bias_type}-habit-${idx}`}>{habit}</li>
+                      ))}
+                    </ul>
+                    <div style={{ fontSize: "12px", color: "var(--muted)" }}>{section.compassionate_note}</div>
                   </div>
-                </div>
+                ))}
               </div>
-            )}
-          </>
-        )}
-
-        {/* Empty State */}
-        {!explainerData && !loading && (
-          <div className="span-12" style={{ textAlign: "center", padding: "40px", backgroundColor: "var(--panel)", borderRadius: "var(--radius)", border: "1px solid var(--stroke)" }}>
-            <div style={{ color: "var(--muted2)" }}>
-              Select a dataset and click "Load Context Explainer" to see market events and
-              explanations connected to your detected trading biases.
             </div>
+
+            <div
+              className="span-12"
+              style={{
+                padding: "12px",
+                backgroundColor: "var(--panel)",
+                borderRadius: "var(--radius)",
+                border: "1px solid var(--stroke)",
+              }}
+            >
+              <div style={{ fontSize: "12px", color: "var(--muted)", lineHeight: 1.6 }}>
+                <div>{explainerData.methodology}</div>
+                <div style={{ marginTop: "6px" }}>{explainerData.global_note}</div>
+              </div>
+            </div>
+          </>
+        ) : null}
+
+        {!datasetId ? (
+          <div
+            className="span-12"
+            style={{
+              textAlign: "center",
+              padding: "40px",
+              backgroundColor: "var(--panel)",
+              borderRadius: "var(--radius)",
+              border: "1px solid var(--stroke)",
+            }}
+          >
+            <div style={{ color: "var(--muted2)" }}>Import a dataset to start emotional check-in and personalized bias context.</div>
           </div>
-        )}
+        ) : null}
       </div>
+
     </div>
   );
 }
-
 function CoachWorkspace({ datasetId }: { datasetId: string | null }) {
   const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; content: string }>>([
     { role: "assistant", content: "Hey what can I help you with today" }
@@ -3344,7 +3371,7 @@ function CoachWorkspace({ datasetId }: { datasetId: string | null }) {
         {/* Disclaimer Card */}
         <div className="span-12" style={{ padding: "12px", backgroundColor: "var(--panel)", borderRadius: "var(--radius)", border: "1px solid var(--stroke)" }}>
           <div style={{ fontSize: "12px", color: "var(--muted2)", lineHeight: "1.5", padding: "8px" }}>
-            <strong>⚠️ Educational Disclaimer:</strong> This coach provides educational information about trading concepts,
+            <strong>Educational Disclaimer:</strong> This coach provides educational information about trading concepts,
             risk management, and general strategies. It does NOT provide personalized financial advice, specific buy/sell
             recommendations, or investment recommendations. Always consult a financial advisor before making investment
             decisions.
@@ -3703,6 +3730,138 @@ function RightRail({ workspace, selectedTrade }: { workspace: Workspace; selecte
     </aside>
   );
 }
+
+function HomeEmotionalCheckInModal({
+  open,
+  datasetId,
+  topBiases,
+  answersByBias,
+  onClose,
+  onAnswer,
+}: {
+  open: boolean;
+  datasetId: string | null;
+  topBiases: TopBiasEntry[];
+  answersByBias: Record<CanonicalBiasType, EmotionalCheckInAnswer[]>;
+  onClose: () => void;
+  onAnswer: (biasType: CanonicalBiasType, questionIndex: number, answer: EmotionalCheckInAnswer) => void;
+}) {
+  if (!open || !datasetId || topBiases.length === 0) return null;
+
+  const answeredCount = topBiases.reduce((count, bias) => {
+    const answers = answersByBias[bias.biasType] ?? [null, null, null];
+    return count + answers.filter((answer) => answer !== null).length;
+  }, 0);
+  const totalCount = topBiases.length * 3;
+  const choices: Array<{ label: string; value: EmotionalCheckInAnswer }> = [
+    { label: "Yes", value: "YES" },
+    { label: "No", value: "NO" },
+    { label: "Skip", value: null },
+  ];
+
+  return (
+    <div
+      className="modalOverlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Emotional check-in modal"
+      onMouseDown={onClose}
+    >
+      <div
+        className="modal"
+        style={{ maxWidth: "980px", width: "min(980px, 96vw)" }}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="modalHdr">
+          <div className="modalHdr__left">
+            <div className="modalTitle">Emotional Check-In</div>
+            <div className="modalSub muted">
+              Answer Yes, No, or Skip for each pre-made question. Answers are saved locally by session.
+            </div>
+          </div>
+          <AntButton className="modalClose" onClick={onClose} aria-label="Close" type="text" icon={<Icon name="close" />} />
+        </div>
+
+        <div className="modalBody">
+          <div style={{ display: "grid", gap: "12px", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))" }}>
+            {topBiases.map((bias) => (
+              <div
+                key={`home-checkin-${bias.biasType}`}
+                style={{
+                  padding: "12px",
+                  backgroundColor: "var(--panel)",
+                  borderRadius: "var(--radius)",
+                  border: "1px solid var(--stroke)",
+                }}
+              >
+                <div className="section__title" style={{ fontSize: "15px" }}>
+                  {CANONICAL_BIAS_LABELS[bias.biasType]}
+                </div>
+                <div style={{ fontSize: "12px", color: "var(--muted)", marginBottom: "10px" }}>Score: {bias.score}/100</div>
+
+                {EMOTIONAL_CHECKIN_QUESTIONS[bias.biasType].map((question, idx) => {
+                  const selected = answersByBias[bias.biasType]?.[idx] ?? null;
+                  return (
+                    <div
+                      key={`home-checkin-${bias.biasType}-${idx}`}
+                      style={{
+                        marginBottom: "12px",
+                        padding: "10px",
+                        border: "1px solid var(--stroke)",
+                        borderRadius: "8px",
+                        backgroundColor: "var(--surfaceA)",
+                      }}
+                    >
+                      <div style={{ fontSize: "13px", marginBottom: "8px", lineHeight: 1.4 }}>{idx + 1}. {question}</div>
+                      <div style={{ display: "flex", gap: "8px" }}>
+                        {choices.map((choice) => {
+                          const active = selected === choice.value;
+                          return (
+                            <button
+                              key={`home-checkin-${bias.biasType}-${idx}-${choice.label}`}
+                              type="button"
+                              onClick={() => onAnswer(bias.biasType, idx, choice.value)}
+                              style={{
+                                border: "1px solid",
+                                borderColor: active ? "rgba(111, 255, 233, 0.6)" : "var(--stroke)",
+                                background: active ? "rgba(111, 255, 233, 0.15)" : "var(--panel)",
+                                color: "var(--text)",
+                                padding: "6px 10px",
+                                borderRadius: "6px",
+                                cursor: "pointer",
+                                fontSize: "12px",
+                              }}
+                            >
+                              {choice.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="modalFtr">
+          <div className="modalFtr__left muted">
+            Progress: <b>{answeredCount}</b> / <b>{totalCount}</b> answered
+          </div>
+          <div className="modalFtr__right">
+            <Button variant="ghost" onClick={onClose} className="modalCancelBtn">
+              Close
+            </Button>
+            <Button variant="primary" onClick={onClose} className="modalImportBtn">
+              Continue
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 /* --------------------------- App Shell --------------------------- */
 
 export default function App() {
@@ -3711,14 +3870,26 @@ export default function App() {
   const [scoringMode, setScoringMode] = useState<ScoringMode>("hybrid");
   const [datasetId, setDatasetId] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisOutput | null>(null);
+  const topBiases = useMemo(() => getTopTwoBiasesFromScores(analysis?.bias_scores), [analysis]);
   const [apiBusy, setApiBusy] = useState(false);
   const [apiError, setApiError] = useState<string>("");
 
   const [csvModalOpen, setCsvModalOpen] = useState(false);
-  const [importedCsvData, setImportedCsvData] = useState<any[]>([]);
+  const [homeCheckinModalOpen, setHomeCheckinModalOpen] = useState(false);
+  const [homeCheckinAnswers, setHomeCheckinAnswers] = useState<Record<CanonicalBiasType, EmotionalCheckInAnswer[]>>(
+    createEmptyCheckinAnswerMap
+  );
+  const skipNextAnalysisEffectRef = useRef(false);
+  const previousWorkspaceRef = useRef<Workspace>("command");
 
   useEffect(() => {
     if (!datasetId) return;
+
+    if (skipNextAnalysisEffectRef.current) {
+      skipNextAnalysisEffectRef.current = false;
+      return;
+    }
+
     let active = true;
 
     const rerunAnalysis = async () => {
@@ -3744,39 +3915,110 @@ export default function App() {
 
   const biasRisk = (() => {
     if (analysis?.behavior_index != null) return Math.round(analysis.behavior_index);
-    const base = workspace === "replay" ? 68 : workspace === "heatmap" ? 62 : 75;
+    const base = workspace === "replay" ? 68 : 75;
     return base;
   })();
+
+  useEffect(() => {
+    if (!datasetId) {
+      setHomeCheckinAnswers(createEmptyCheckinAnswerMap());
+      setHomeCheckinModalOpen(false);
+      return;
+    }
+
+    const nextAnswers = createEmptyCheckinAnswerMap();
+    topBiases.forEach((bias) => {
+      nextAnswers[bias.biasType] = readStoredBiasAnswers(datasetId, bias.biasType);
+    });
+    setHomeCheckinAnswers(nextAnswers);
+  }, [datasetId, topBiases]);
+
+  useEffect(() => {
+    const previousWorkspace = previousWorkspaceRef.current;
+    const enteredBiasContext = workspace === "pulse" && previousWorkspace !== "pulse";
+
+    if (enteredBiasContext && datasetId && topBiases.length > 0) {
+      setHomeCheckinModalOpen(true);
+    }
+
+    previousWorkspaceRef.current = workspace;
+  }, [workspace, datasetId, topBiases.length]);
+
+  const tradesWorkspaceRows = useMemo<Trade[]>(() => {
+    const biasMap: Record<string, DisplayBiasType> = {
+      "overtrading": "Overtrading",
+      "loss_aversion": "Loss Aversion",
+      "revenge_trading": "Revenge Trading",
+      "recency_bias": "Recency Bias",
+    };
+    return (analysis?.flagged_trades ?? []).map((ft) => ({
+      id: ft.trade_id || "",
+      time: ft.timestamp
+        ? new Date(ft.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+        : "",
+      symbol: ft.symbol || "",
+      side: (ft.side || "Buy") as "Buy" | "Sell",
+      size: ft.quantity || 0,
+      durationMin: 0,
+      pnl: ft.profit_loss || 0,
+      balance: ft.balance,
+      flags: [biasMap[ft.bias] || ft.bias] as DisplayBiasType[],
+      confidence: ft.confidence || 0,
+      evidence: ft.evidence?.join(" | ") || "",
+    }));
+  }, [analysis?.flagged_trades]);
+
+  useEffect(() => {
+    if (tradesWorkspaceRows.length === 0) {
+      if (selectedTrade !== null) setSelectedTrade(null);
+      return;
+    }
+    const selectedId = selectedTrade?.id;
+    if (!selectedId || !tradesWorkspaceRows.some((trade) => trade.id === selectedId)) {
+      setSelectedTrade(tradesWorkspaceRows[0]);
+    }
+  }, [tradesWorkspaceRows, selectedTrade?.id]);
+
+  const updateHomeCheckinAnswer = (biasType: CanonicalBiasType, questionIndex: number, answer: EmotionalCheckInAnswer) => {
+    if (!datasetId) return;
+
+    setHomeCheckinAnswers((previous) => {
+      const current = previous[biasType] ?? [null, null, null];
+      const updatedAnswers: EmotionalCheckInAnswer[] = [current[0] ?? null, current[1] ?? null, current[2] ?? null];
+      updatedAnswers[questionIndex] = answer;
+      writeStoredBiasAnswers(datasetId, biasType, updatedAnswers);
+      return {
+        ...previous,
+        [biasType]: updatedAnswers,
+      };
+    });
+  };
 
   const handleImported = async (payload: CsvImportPayload) => {
     setApiBusy(true);
     setApiError("");
-    setImportedCsvData(payload.rows);
-
-    const importRequest: ImportDatasetRequest = {
-      raw_csv: payload.rawText,
-      rows: payload.rows,
-      mapping: payload.mapping,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-      session_template: "equities_rth",
-    };
 
     try {
-      const imported = await importDataset(importRequest);
+      const imported = await importDatasetFile(payload.file, {
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+        session_template: "equities_rth",
+      });
+      skipNextAnalysisEffectRef.current = true;
       setDatasetId(imported.dataset_id);
       const analyzed = await analyzeDataset({ dataset_id: imported.dataset_id, scoring_mode: scoringMode });
       setAnalysis(analyzed);
+      setHomeCheckinModalOpen(false);
+      const importedRows = imported.stats?.rows ?? 0;
       antMessage.success(
-        `Imported ${payload.rows.length.toLocaleString()} rows. Behavior Index ${Math.round(analyzed.behavior_index)}.`
+        `Imported ${importedRows.toLocaleString()} rows from ${payload.file.name}. Behavior Index ${Math.round(analyzed.behavior_index)}.`
       );
     } catch (error: unknown) {
-      const fallback = buildLocalFallbackAnalysis();
-      setAnalysis(fallback);
-      setDatasetId("local-preview");
-      setApiError(getErrorMessage(error, "Backend unavailable. Running local preview mode."));
-      antMessage.warning(
-        `Imported ${payload.rows.length.toLocaleString()} rows in local preview mode. Start backend API to enable /import and /analyze.`
-      );
+      skipNextAnalysisEffectRef.current = false;
+      setDatasetId(null);
+      setAnalysis(null);
+      setHomeCheckinModalOpen(false);
+      setApiError(getErrorMessage(error, "Import failed. Backend processing is required."));
+      antMessage.error(`Failed to import ${payload.file.name}. Check backend logs and CSV format.`);
     } finally {
       setApiBusy(false);
     }
@@ -3826,44 +4068,14 @@ export default function App() {
           )}
           {workspace === "trades" && (
             <TradesWorkspace
-              trades={analysis?.flagged_trades?.map((ft) => {
-                const biasMap: Record<string, BiasType> = {
-                  "overtrading": "Overtrading",
-                  "loss_aversion": "Loss Aversion",
-                  "revenge_trading": "Revenge Trading",
-                  "recency_bias": "Recency Bias",
-                };
-                return {
-                  id: ft.trade_id || "",
-                  time: ft.timestamp ? new Date(ft.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }) : "",
-                  symbol: ft.symbol || "",
-                  side: (ft.side || "Buy") as "Buy" | "Sell",
-                  size: ft.quantity || 0,
-                  durationMin: 0,
-                  pnl: ft.profit_loss || 0,
-                  flags: [biasMap[ft.bias] || ft.bias] as BiasType[],
-                  confidence: ft.confidence || 0,
-                  evidence: ft.evidence?.join(" | ") || "",
-                };
-              }) || []}
+              trades={tradesWorkspaceRows}
               selected={selectedTrade}
               onSelect={(t) => setSelectedTrade(t)}
               flaggedTradesRaw={analysis?.flagged_trades}
               biasScores={analysis?.bias_scores}
             />
           )}
-          {workspace === "heatmap" && (
-            <HeatmapWorkspace
-              dangerHours={analysis?.danger_hours}
-              dailyPnl={analysis?.daily_pnl}
-              tradeTimeline={analysis?.trade_timeline}
-              biasScores={analysis?.bias_scores}
-              topTriggers={analysis?.top_triggers}
-              flaggedTrades={analysis?.flagged_trades}
-              explainability={analysis?.explainability}
-            />
-          )}
-          {workspace === "simulator" && <SimulatorWorkspace analysisData={analysis} importedCsvData={importedCsvData} />}
+          {workspace === "simulator" && <SimulatorWorkspace analysisData={analysis} datasetId={datasetId} />}
           {workspace === "replay" && (
             <PracticeWorkspace 
               datasetId={datasetId}
@@ -3871,7 +4083,7 @@ export default function App() {
               analysis={analysis}
             />
           )}
-          {workspace === "pulse" && <PulseWorkspace datasetId={datasetId} />}
+          {workspace === "pulse" && <PulseWorkspace datasetId={datasetId} analysis={analysis} />}
           {workspace === "coach" && <CoachWorkspace datasetId={datasetId} />}
         </main>
 
@@ -3890,9 +4102,19 @@ export default function App() {
         onClose={() => setCsvModalOpen(false)}
         onImported={handleImported}
       />
+      <HomeEmotionalCheckInModal
+        open={homeCheckinModalOpen}
+        datasetId={datasetId}
+        topBiases={topBiases}
+        answersByBias={homeCheckinAnswers}
+        onClose={() => setHomeCheckinModalOpen(false)}
+        onAnswer={updateHomeCheckinAnswer}
+      />
     </div>
   );
 }
+
+
 
 
 

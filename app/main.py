@@ -98,8 +98,6 @@ async def startup_event():
         logger.info("✓ OpenAI configuration verified")
     else:
         logger.warning("⚠️  OpenAI not properly configured - practice features may not work")
-
-
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():

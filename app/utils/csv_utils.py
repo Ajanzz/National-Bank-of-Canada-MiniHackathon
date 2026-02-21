@@ -51,9 +51,11 @@ def coerce_numeric(value):
         return None
 
 
-def coerce_side(side_str: str) -> str:
+def coerce_side(side_str) -> str:
     """Coerce side to BUY or SELL."""
-    s = side_str.upper().strip()
+    if side_str is None or (isinstance(side_str, float) and side_str != side_str):
+        raise ValueError("Missing side value")
+    s = str(side_str).upper().strip()
     if s in ("BUY", "LONG"):
         return "BUY"
     elif s in ("SELL", "SHORT"):

@@ -1,6 +1,6 @@
 """Market shock event generator."""
 
-from datetime import datetime
+import numpy as np
 from app.models.schemas import EventData
 
 
@@ -16,26 +16,21 @@ def generate_market_shocks_from_trades(trades) -> list[EventData]:
     if not trades:
         return []
     
-    shocks = []
+    pnl_abs = np.fromiter((abs(t.profit_loss) for t in trades), dtype=np.float64, count=len(trades))
+    if len(pnl_abs) < 10:
+        p90 = float(pnl_abs.max()) if len(pnl_abs) > 0 else 0.0
+    else:
+        p90 = float(np.percentile(pnl_abs, 90))
     
-    # Compute PnL magnitudes
-    pnl_abs = [abs(t.profit_loss) for t in trades]
-    if not pnl_abs:
-        return []
-    
-    sorted_abs = sorted(pnl_abs)
-    p90 = sorted_abs[int(len(sorted_abs) * 0.9)] if len(sorted_abs) >= 10 else max(sorted_abs)
-    
-    # Identify shocks
-    for trade in trades:
-        if abs(trade.profit_loss) >= p90:
-            shock = EventData(
-                timestamp=trade.timestamp,
-                event_type="market_shock",
-                label=f"{'Loss' if trade.profit_loss < 0 else 'Gain'} spike: ${abs(trade.profit_loss):.0f}",
-                symbols=[trade.asset],
-                pnl_magnitude=trade.profit_loss,
-            )
-            shocks.append(shock)
-    
+    shocks = [
+        EventData(
+            timestamp=t.timestamp,
+            event_type="market_shock",
+            label=f"{'Loss' if t.profit_loss < 0 else 'Gain'} spike: ${abs(t.profit_loss):.0f}",
+            symbols=[t.asset],
+            pnl_magnitude=t.profit_loss,
+        )
+        for t in trades
+        if abs(t.profit_loss) >= p90
+    ]
     return shocks
