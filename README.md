@@ -4,6 +4,14 @@
 
 ---
 
+## Demo Video
+
+[![Watch the Demo](https://img.youtube.com/vi/715jfb-Y7CE/maxresdefault.jpg)](https://www.youtube.com/watch?v=715jfb-Y7CE)
+
+Check out the video for an overview of the **Insid-ur Trading** platform in action!
+
+---
+
 ## Table of Contents
 
 - [Features](#features)
